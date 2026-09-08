@@ -1,4 +1,4 @@
-# xsamplefe 1.1.0 — installing on another machine
+# xsamplefe 1.2.0 — installing on another machine
 
 ## Contents of the archive
 
@@ -15,13 +15,13 @@
 Either add the folder to the ado-path for the session
 
 ```stata
-adopath ++ "/path/to/xsamplefe-1.1.0/stata"
+adopath ++ "/path/to/xsamplefe-1.2.0/stata"
 ```
 
 or install it permanently
 
 ```stata
-net install xsamplefe, from("/path/to/xsamplefe-1.1.0/stata") replace
+net install xsamplefe, from("/path/to/xsamplefe-1.2.0/stata") replace
 ```
 
 `xsamplefe` loads `xsamplefe.plugin` from the same folder as `xsamplefe.ado`.
@@ -114,6 +114,7 @@ datasets when `XSF_SERGIO_DIR` points at them; otherwise it prints "skipped".
 . return list
 . xsamplefe 10, absorb(worker firm year) mobstrata generate(s2)     // proportional mobility classes
 . xsamplefe 10, absorb(worker firm year) reconnect generate(s3)     // largest component back to the frame share (sample grows)
+. xsamplefe 10, absorb(worker firm year) minmovers(2) generate(s4)  // drop firms with fewer than 2 movers (cascades)
 . xsamplefe 5,  absorb(worker firm year) movers(100) stayers(5) connected   // all movers, 5% stayers, largest component
 . reghdfe y x if s == 1, absorb(worker firm year)
 . xhdfe   y x if s == 1, absorb(worker firm year)

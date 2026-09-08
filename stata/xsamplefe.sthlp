@@ -1,5 +1,5 @@
 {smcl}
-{* *! version 1.1.0  08sep2026}{...}
+{* *! version 1.2.0  08sep2026}{...}
 {vieweralsosee "[D] sample" "help sample"}{...}
 {vieweralsosee "[R] bsample" "help bsample"}{...}
 {vieweralsosee "" "--"}{...}
@@ -12,6 +12,7 @@
 {viewerjumpto "Reproducibility" "xsamplefe##reproducibility"}{...}
 {viewerjumpto "Mobility fidelity" "xsamplefe##mobility"}{...}
 {viewerjumpto "Connectivity" "xsamplefe##connectivity"}{...}
+{viewerjumpto "Limited mobility bias" "xsamplefe##bias"}{...}
 {viewerjumpto "Options" "xsamplefe##options"}{...}
 {viewerjumpto "Examples" "xsamplefe##examples"}{...}
 {viewerjumpto "Stored results" "xsamplefe##results"}{...}
@@ -63,6 +64,7 @@
 {synopt :{opt mobstr:ata}}add the number of distinct {opt mobility()} values per unit to the {opt by()} strata{p_end}
 {synopt :{opt connectiv:ity}}report the components of the unit-mobility graph on the frame and on the sample{p_end}
 {synopt :{opt conn:ected}}keep only the largest connected component of the sampled unit-mobility graph{p_end}
+{synopt :{opt minmov:ers(#)}}drop the {opt mobility()} values with fewer than {it:#} movers, and the units linked to them{p_end}
 {synopt :{opt recon:nect}}add unsampled units until the largest component reaches the share it has in the frame{p_end}
 {synopt :{opt recont:arget(#)}}same, with an explicit target share (percent of the sample rows); implies {opt reconnect}{p_end}
 {synopt :{opt reconr:ule(gain|key)}}order in which {opt reconnect} takes the frontier: largest gain (default) or smallest uniform key{p_end}
@@ -398,6 +400,71 @@ stratified. {opt connected} is applied after {opt reconnect}, and
 indivisible; adding a unit could split one).
 
 
+{marker bias}{...}
+{title:Limited mobility bias}
+
+{pstd}
+Whole-unit sampling keeps the {it:parameters} of the population: the true
+variance decomposition of the sample is the population's. It does not keep the
+{it:precision} of a two-way fixed-effect estimator. AKM firm effects are
+unbiased one by one, but each is estimated with noise, and that noise inflates
+{cmd:Var(psi_hat)} and depresses {cmd:Cov(alpha_hat, psi_hat)}: the classic
+limited mobility bias (Bonhomme, Lamadon and Manresa, "The ABC of AKM",
+{it:Journal of Economic Perspectives}, 2026). Its size is governed by the
+number of {it:movers per mobility value}, which is exactly what a sample takes
+away, so {opt connectivity} reports that number too:
+{cmd:r(movers_per_mob_frame)} and {cmd:r(movers_per_mob)} give the mean over
+the mobility values present in the frame and in the sample, and
+{cmd:r(weak_mob_share_frame)} and {cmd:r(weak_mob_share)} the share of them
+linked to at most one mover. They cost one more pass over the frame rows, so
+{opt connected} and {opt reconnect}, which need only the components, do not
+compute them; {opt connectivity} and {opt minmovers()} do.
+
+{pstd}
+Measured on the calibrated panel of that article (6,000 workers, 300 firms,
+5 periods, 30,000 rows), each design estimated on its own connected set:
+
+{p2colset 9 36 38 2}{...}
+{p2col :{it:design}}{it:rows, movers per firm, Var(psi) true -> AKM, 2Cov true -> AKM}{p_end}
+{p2col :population}30,000 rows, 30.3 movers/firm, Var(psi) 0.096 -> 0.101, 2Cov 0.190 -> 0.182{p_end}
+{p2col :25 percent of workers}7,500 rows, 7.7 movers/firm, Var(psi) 0.097 -> 0.116, 2Cov 0.190 -> 0.157{p_end}
+{p2col :10 percent of workers}2,925 rows, 3.2 movers/firm, Var(psi) 0.098 -> 0.166, 2Cov 0.196 -> 0.109{p_end}
+{p2col :10 percent of rows}1,738 rows, 2.1 movers/firm, Var(psi) 0.087 -> 0.440, 2Cov 0.177 -> -0.338{p_end}
+{p2col :{cmd:movers(100) stayers(10)}}19,735 rows, 30.3 movers/firm, Var(psi) 0.089 -> 0.093, 2Cov 0.139 -> 0.133{p_end}
+{p2colreset}{...}
+
+{pstd}
+Read the table as follows. The {it:true} columns barely move across the unit
+designs: the draw is faithful. The {it:AKM} columns do move: the estimated
+{cmd:Var(psi)} is 5 percent above the truth on the full data, 20 percent at a
+quarter of the workers and 70 percent at a tenth, and drawing the same number
+of {it:rows} instead of units multiplies it by five and turns the covariance
+negative. Practical consequences:
+
+{p 8 12 2}- for coefficients on covariates, a unit sample is unbiased and only
+loses precision (see the Monte Carlo in {cmd:tests/xsamplefe_estimation_cert.do});{p_end}
+{p 8 12 2}- for a {it:variance decomposition} meant to be compared with the
+full data, sample the movers in full: {cmd:movers(100) stayers(#)} restores the
+full-data movers per firm and an essentially unbiased decomposition, of a
+{it:different} population (its own {cmd:2Cov} is 0.139 against 0.190);{p_end}
+{p 8 12 2}- {opt minmovers(#)} removes the mobility values that carry the most
+noise, but it does not remove the bias: on the same panel it takes the share of
+firms with at most one mover from 17 percent to zero and leaves the ratio
+essentially where it was.{p_end}
+
+{pstd}
+{opt minmovers(#)} keeps only the mobility values linked to {it:#} or more
+movers. Units are indivisible, so a value that is too weak is removed by
+dropping {it:every unit linked to it}, which can turn other units into stayers
+and other values weak: the rule is iterated to a fixed point (jointly with
+{opt connected} when both are given). {cmd:r(N_units_minmovers_dropped)},
+{cmd:r(N_minmovers_dropped)} and {cmd:r(minmovers_iterations)} report the cost.
+The pruning {it:cascades}: on a 10 percent unit draw of that panel
+{cmd:minmovers(2)} drops 46 of 300 units, while {cmd:minmovers(3)} empties the
+sample and says so. Try a small {it:#} first, and prefer
+{cmd:movers(100) stayers(#)} when what you need is precision.
+
+
 {marker options}{...}
 {title:Options}
 
@@ -478,10 +545,13 @@ with {opt count}) for movers and stayers; with {cmd:movers(100) stayers(5)} all
 movers and 5 percent of the stayers are drawn.
 
 {phang}{opt connectivity} computes and stores the components of the
-unit-mobility graph on the eligible frame and on the final sample; see
-{help xsamplefe##connectivity:Connectivity}. It is off by default because each
+unit-mobility graph on the eligible frame and on the final sample, and the
+movers per {opt mobility()} value on both; see
+{help xsamplefe##connectivity:Connectivity} and
+{help xsamplefe##bias:Limited mobility bias}. It is off by default because each
 graph costs a serial union-find over every frame row; {opt connected} and
-{opt reconnect} build the same graphs and report them without the option.
+{opt reconnect} build the same graphs and report the components without the
+option, but not the movers per value, which cost one further pass.
 
 {phang}{opt mobstrata} adds the number of distinct {opt mobility()} values of
 the unit (its mobility class) to the {opt by()} strata, so that the classes are
@@ -491,6 +561,16 @@ strata. It is the option form of the {cmd:by(nfirms)} recipe in
 
 {phang}{opt connected} keeps only the largest connected component of the
 unit-mobility graph of the retained rows.
+
+{phang}{opt minmovers(#)} drops, after the draw, every {opt mobility()} value
+linked to fewer than {it:#} movers together with the units linked to it, and
+iterates until no such value is left (jointly with {opt connected} when both
+are given). It never splits a unit, so the pruning cascades and can empty the
+sample; the counts are in {cmd:r(N_units_minmovers_dropped)},
+{cmd:r(N_minmovers_dropped)} and {cmd:r(minmovers_iterations)}. It implies the
+{opt connectivity} diagnostics and may not be combined with {opt reconnect}
+(which grows what it prunes) or with a {opt group()} closure. See
+{help xsamplefe##bias:Limited mobility bias}.
 
 {phang}{opt reconnect} and {opt recontarget(#)} add eligible units that were not
 drawn until the largest component of the sample covers the share of rows it
@@ -609,14 +689,20 @@ are not counted{p_end}
 {synopt:{cmd:r(N_periods)}}distinct {opt time()} values in the frame{p_end}
 {synopt:{cmd:r(N_mobility)}, {cmd:r(N_mobility_retained)}}distinct {opt mobility()} values in the frame / in the retained frame rows{p_end}
 {synopt:{cmd:r(N_groups)}, {cmd:r(N_groups_kept)}, {cmd:r(N_groups_retained)}}groups in the frame / kept by the closure rule / with retained rows{p_end}
-{synopt:{cmd:r(N_components_frame)}, {cmd:r(lcc_share_frame)}}with {opt connectivity}, {opt connected} or
-{opt reconnect}: components of the unit-mobility graph on the eligible frame, and the share of its rows in the largest
-one{p_end}
+{synopt:{cmd:r(N_components_frame)}, {cmd:r(lcc_share_frame)}}with {opt connectivity}, {opt connected},
+{opt reconnect} or {opt minmovers()}: components of the unit-mobility graph on the eligible frame, and the share of its
+rows in the largest one{p_end}
 {synopt:{cmd:r(N_components)}, {cmd:r(lcc_share)}}the same on the final sample{p_end}
 {synopt:{cmd:r(lcc_units_share)}, {cmd:r(lcc_mobility_share)}}share of the sample's units / {opt mobility()} values in its largest component{p_end}
 {synopt:{cmd:r(N_units_lcc_kept)}}retained units that were in the frame's largest component and are in the sample's largest one{p_end}
+{synopt:{cmd:r(movers_per_mob_frame)}, {cmd:r(movers_per_mob)}}with {opt connectivity} or {opt minmovers()}: mean number
+of movers per {opt mobility()} value, in the frame and in the sample{p_end}
+{synopt:{cmd:r(weak_mob_share_frame)}, {cmd:r(weak_mob_share)}}the same for the share of {opt mobility()} values linked
+to at most one mover{p_end}
 {synopt:{cmd:r(N_units_reconnected)}, {cmd:r(N_reconnected)}}units and observations added by {opt reconnect} (totals,
 not broken down by {opt by()} stratum){p_end}
+{synopt:{cmd:r(N_units_minmovers_dropped)}, {cmd:r(N_minmovers_dropped)}, {cmd:r(minmovers_iterations)}}units and
+observations dropped by {opt minmovers(#)}, and the number of passes it took{p_end}
 {synopt:{cmd:r(pct)} or {cmd:r(count)}}the {it:#} specified{p_end}
 {synopt:{cmd:r(n_uniforms)}}number of uniform key columns drawn{p_end}
 {synopt:{cmd:r(threads_requested)}, {cmd:r(threads_effective)}, {cmd:r(threads_used)}, {cmd:r(thread_capacity)}, {cmd:r(openmp_enabled)}}OpenMP
@@ -626,11 +712,15 @@ diagnostics{p_end}
 Results that do not apply are missing ({cmd:.}): {cmd:r(N_periods)} without
 {opt time()}, the mobility results without a mobility dimension,
 {cmd:r(N_groups*)} without {opt group()}, the {opt reconnect} counts without
-{opt reconnect}, and the seven connectivity results
-({cmd:r(N_components_frame)}, {cmd:r(lcc_share_frame)},
-{cmd:r(N_components)}, {cmd:r(lcc_share)}, {cmd:r(lcc_units_share)},
-{cmd:r(lcc_mobility_share)}, {cmd:r(N_units_lcc_kept)}) unless
-{opt connectivity}, {opt connected} or {opt reconnect} was specified. Zero
+{opt reconnect}, the {opt minmovers()} counts without {opt minmovers()}, and
+the eleven connectivity results ({cmd:r(N_components_frame)},
+{cmd:r(lcc_share_frame)}, {cmd:r(N_components)}, {cmd:r(lcc_share)},
+{cmd:r(lcc_units_share)}, {cmd:r(lcc_mobility_share)},
+{cmd:r(N_units_lcc_kept)}) unless {opt connectivity}, {opt connected},
+{opt reconnect} or {opt minmovers()} was specified, and the four
+movers-per-value results ({cmd:r(movers_per_mob_frame)},
+{cmd:r(movers_per_mob)}, {cmd:r(weak_mob_share_frame)},
+{cmd:r(weak_mob_share)}) unless {opt connectivity} or {opt minmovers()} was. Zero
 means zero. {cmd:r(n_components)} keeps its own meaning: the components found
 by {opt connected}, missing without it.
 

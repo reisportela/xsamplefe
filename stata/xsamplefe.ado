@@ -1,11 +1,11 @@
-*! version 1.1.0  08sep2026
+*! version 1.2.0  08sep2026
 *! xsamplefe: panel / fixed-effect aware random sampling for reghdfe and xhdfe
 *! - sample / sample2 semantics for the simple cases (drawn rows are
 *!   bit-identical to sample under the same seed and data order)
 *! - whole-unit sampling aligned with absorb(), group() and individual()
 *! - strata, balanced panels, mobility structure and connected sets
-*! - connectivity diagnostics (connectivity) and reconnect for the largest
-*!   component of the unit-mobility graph
+*! - connectivity, movers-per-mobility and minmovers() diagnostics, and
+*!   reconnect for the largest component of the unit-mobility graph
 *! - OpenMP C++ plugin (xsamplefe.plugin) with no external dependencies
 
 program define xsamplefe, rclass byable(onecall)
@@ -28,7 +28,8 @@ program define xsamplefe, rclass byable(onecall)
         MOVers(numlist max=1 >=0) STAYers(numlist max=1 >=0) ///
         MOBSTRata ///
         ANY ALL GROUPRule(string) ///
-        CONNECTIVity CONNected RECONnect RECONTarget(numlist max=1 >=0 <=100) ///
+        CONNECTIVity CONNected MINMOVers(numlist max=1 integer >=0) ///
+        RECONnect RECONTarget(numlist max=1 >=0 <=100) ///
         RECONRule(string) ///
         GENerate(name) KEEP(name) REPLACE ///
         SEED(string) ///
@@ -280,19 +281,30 @@ program define xsamplefe, rclass byable(onecall)
     local has_mob = ("`mobility'" != "")
     if (!`has_mob' & (`minmobility' >= 0 | `maxmobility' >= 0 | "`movers'" != "" | ///
                        "`stayers'" != "" | "`connected'" != "" | "`reconnect'" != "" | ///
-                       "`mobstrata'" != "" | "`connectivity'" != "")) {
-        di as err "{p 0 4}minmobility(), maxmobility(), movers(), stayers(), mobstrata, connectivity, connected and reconnect require a mobility dimension: specify mobility(), a second absorb() variable, or group() with individual(){p_end}"
+                       "`mobstrata'" != "" | "`connectivity'" != "" | "`minmovers'" != "")) {
+        di as err "{p 0 4}minmobility(), maxmobility(), movers(), stayers(), mobstrata, connectivity, connected, minmovers() and reconnect require a mobility dimension: specify mobility(), a second absorb() variable, or group() with individual(){p_end}"
         exit 198
     }
-    if ("`reconnect'" != "" & `has_block') {
-        di as err "{p 0 4}reconnect may not be combined with a group() closure (group() different from the sampling unit): groups are indivisible and reconnect adds whole units{p_end}"
+    foreach o in reconnect minmovers {
+        if ("``o''" != "" & `has_block') {
+            di as err "{p 0 4}`o' may not be combined with a group() closure (group() different from the sampling unit): groups are indivisible and `o' adds or removes whole units{p_end}"
+            exit 198
+        }
+    }
+    if ("`reconnect'" != "" & "`minmovers'" != "") {
+        di as err "{p 0 4}reconnect and minmovers() may not be combined: reconnect grows the largest component and minmovers() prunes it, so the target of reconnect would no longer hold at the end{p_end}"
         exit 198
     }
     local recon_target -1
     if ("`recontarget'" != "") local recon_target `recontarget'
+    local minmov -1
+    if ("`minmovers'" != "") local minmov `minmovers'
     // the connectivity diagnostics cost a union-find over the frame rows: they
     // are computed only when asked for, or when an option needs them
-    local has_diag = ("`connectivity'`connected'`reconnect'" != "" & `has_mob')
+    local has_diag = ("`connectivity'`connected'`reconnect'`minmovers'" != "" & `has_mob')
+    // the movers per mobility value cost an extra pass, so connected and
+    // reconnect, which need only the components, do not compute them
+    local has_mobdiag = ("`connectivity'`minmovers'" != "" & `has_mob')
 
     local frame_rule strict
     if ("`any'`all'" != "") {
@@ -381,6 +393,7 @@ program define xsamplefe, rclass byable(onecall)
     if ("`stayers'" != "") local cfg "`cfg'rate_stayers=`stayers';"
     local cfg "`cfg'mobstrata=`=("`mobstrata'" != "")';connectivity=`=("`connectivity'" != "")';"
     local cfg "`cfg'reconnect=`=("`reconnect'" != "")';recon_target=`recon_target';recon_rule=`reconrule';"
+    local cfg "`cfg'minmovers=`minmov';"
     local cfg "`cfg'connected=`=("`connected'" != "")';num_threads=`numthreads';"
     local cfg "`cfg'verbose=`=("`verbose'" != "")';s_prefix=`sp';"
 
@@ -424,7 +437,9 @@ program define xsamplefe, rclass byable(onecall)
         U_retained U_movers_eligible U_movers_selected U_movers_retained U_split ///
         U_partial U_inelig_ret K_target S_by S_final T_periods M_frame M_retained ///
         G_frame G_kept G_retained C_frame LCC_frame_share C_sample LCC_share ///
-        LCC_units_share LCC_mob_share U_lcc_kept U_reconnected N_reconnected ///
+        LCC_units_share LCC_mob_share U_lcc_kept MPM_frame MPM_sample ///
+        WEAK_frame WEAK_sample U_reconnected N_reconnected ///
+        U_minmovers_dropped N_minmovers_dropped minmovers_iterations ///
         threads_requested threads_effective threads_used openmp_enabled thread_capacity
     if (`rc') {
         foreach s of local scalars {
@@ -502,6 +517,12 @@ program define xsamplefe, rclass byable(onecall)
             as res %5.1f 100 * `LCC_frame_share' as txt "% of rows; sample " as res %8.0fc `C_sample' ///
             as txt " component(s), largest " as res %5.1f 100 * `LCC_share' as txt "% of rows"
     }
+    if (`has_mobdiag') {
+        di as txt "  movers per `mobility_display': frame " as res %8.1f `MPM_frame' ///
+            as txt "  sample " as res %8.1f `MPM_sample' ///
+            as txt "; values with at most one mover: frame " as res %5.1f 100 * `WEAK_frame' ///
+            as txt "%  sample " as res %5.1f 100 * `WEAK_sample' as txt "%"
+    }
     if (`has_block') {
         di as txt "  group closure (" as res "`block'" as txt ", `grouprule'): groups kept " ///
             as res %12.0fc `G_kept' as txt " of " as res %12.0fc `G_frame'
@@ -510,6 +531,14 @@ program define xsamplefe, rclass byable(onecall)
         di as txt "  reconnect (" as res "`reconrule'" as txt "): " as res %12.0fc `U_reconnected' as txt " unit(s) added (" ///
             as res %12.0fc `N_reconnected' as txt " observations) to reach a largest component of " ///
             as res %5.1f 100 * `LCC_share' as txt "% of the sample rows"
+    }
+    if ("`minmovers'" != "") {
+        di as txt "  minmovers(" as res "`minmovers'" as txt "): " as res %12.0fc `U_minmovers_dropped' ///
+            as txt " unit(s) dropped (" as res %12.0fc `N_minmovers_dropped' ///
+            as txt " observations) in " as res %3.0f `minmovers_iterations' as txt " pass(es)"
+        if (`N_frame_retained' == 0) {
+            di as txt "  note: minmovers(`minmovers') left no observations; the pruning cascades, so try a smaller # or movers(100) stayers(#)"
+        }
     }
     if ("`connected'" != "") {
         di as txt "  connected set: " as res %6.0fc `n_components' as txt " component(s); " ///
@@ -559,8 +588,15 @@ program define xsamplefe, rclass byable(onecall)
     return scalar lcc_units_share = `LCC_units_share'
     return scalar lcc_mobility_share = `LCC_mob_share'
     return scalar N_units_lcc_kept = `U_lcc_kept'
+    return scalar movers_per_mob_frame = `MPM_frame'
+    return scalar movers_per_mob = `MPM_sample'
+    return scalar weak_mob_share_frame = `WEAK_frame'
+    return scalar weak_mob_share = `WEAK_sample'
     return scalar N_units_reconnected = `U_reconnected'
     return scalar N_reconnected = `N_reconnected'
+    return scalar N_units_minmovers_dropped = `U_minmovers_dropped'
+    return scalar N_minmovers_dropped = `N_minmovers_dropped'
+    return scalar minmovers_iterations = `minmovers_iterations'
     return scalar threads_requested = `threads_requested'
     return scalar threads_effective = `threads_effective'
     return scalar threads_used = `threads_used'

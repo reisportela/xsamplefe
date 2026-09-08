@@ -1,4 +1,4 @@
-# xsamplefe 1.0.0 / 1.1.0 — validation record (08sep2026)
+# xsamplefe 1.0.0 / 1.1.0 / 1.2.0 — validation record (08sep2026)
 
 Host: shared 48-logical-processor Linux workstation (1 TB RAM), Stata/MP,
 GCC 11.5, plugin built with `--linux --openmp`. All datasets below are the ones
@@ -331,6 +331,92 @@ One-off run (not part of the certification) on this host:
   exceeds the 2,147,483,647 limit of this plugin's 32-bit indices", after
   109 s of reading and ranking.
 
+## 1.2.0 (08sep2026): limited mobility bias, movers per firm, `minmovers()`
+
+Prompted by the companion notebook of Bonhomme, Lamadon and Manresa, "A Users'
+Guide to Uncovering Worker and Firm Effects: The ABC of AKM" (*Journal of
+Economic Perspectives*, 2026; arXiv 2603.17034). The notebook implements a
+homophily mobility model, AKM by OLS and by alternating projections, a largest
+connected component identical in effect to `connected` (it picks the largest
+component by number of firms, `xsamplefe` by number of rows), and shows the
+upward bias of the estimated `Var(psi)`. It implements no bias correction, no
+leave-one-out connected set and no minimum-mover rule, so nothing was ported;
+what it changed here is the validation and the documentation.
+
+### The distinction that matters: parameters versus precision
+
+Their calibrated DGP (lambda .559, rho .351, sigma .369, s_alpha .550,
+s_psi .317, 10 worker groups) ported to Stata, 6,000 workers, 300 firms, 5
+periods, 30,000 rows, each design estimated on its own connected set
+(`tests/xsamplefe_estimation_cert.do`, section 4):
+
+| design | rows | movers/firm | Var(psi) true | Var(psi) AKM | ratio | 2Cov true | 2Cov AKM |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| population | 30,000 | 30.3 | 0.096 | 0.101 | 1.05 | 0.190 | 0.182 |
+| 25% of workers | 7,500 | 7.7 | 0.097 | 0.116 | 1.20 | 0.190 | 0.157 |
+| 10% of workers | 2,925 | 3.2 | 0.098 | 0.166 | 1.70 | 0.196 | 0.109 |
+| 10% of rows (`sample`) | 1,738 | 2.1 | 0.087 | 0.440 | 5.07 | 0.177 | −0.338 |
+| `movers(100) stayers(10)` | 19,735 | 30.3 | 0.089 | 0.093 | 1.05 | 0.139 | 0.133 |
+
+The sampling is faithful: the *true* decomposition of every unit sample is the
+population's to within 3 percent. The AKM *estimator* is not, and the loss
+tracks the movers per firm. On a larger version of the same panel (500 firms,
+20,000 workers, 100,000 rows), estimated without restricting to the connected
+set, the ratio goes 1.005 (population), 1.013 (50%), 1.102 (25%), 1.216 (10%)
+and 2.755 with `sample 10`; the movers per firm go 61.9, 30.8, 15.3, 6.2 and
+2.7, and the share of firms with at most one mover 0%, 0%, 0%, 2.2% and 23%.
+
+### What was added
+
+- `r(movers_per_mob_frame)`, `r(movers_per_mob)`, `r(weak_mob_share_frame)`
+  and `r(weak_mob_share)`: mean movers per `mobility()` value and share of
+  values with at most one mover, on the eligible frame and on the sample.
+  Computed under `connectivity` (implied by `connected`, `reconnect` and
+  `minmovers()`), verified against a pure-Stata computation to 1e-12 on
+  nlswork, on the frame and on the sample.
+- `minmovers(#)`: after the draw, every `mobility()` value with fewer than #
+  movers is removed together with the units linked to it, iterated to a fixed
+  point (jointly with `connected`). Units are never split, so the pruning
+  cascades. On a 10% unit draw of the certification panel: `minmovers(2)`
+  drops 46 of 300 units in 5 passes and takes the share of firms with at most
+  one mover from 16.9% to 0; `minmovers(3)` empties the sample in 9 passes and
+  prints a note. It removes the noisiest firms, not the bias: on the same panel
+  without the connected-set restriction the Var(psi) ratio of the 10% sample
+  moves from 1.606 to 1.598 when `minmovers(2)` is added. Refused with `reconnect`
+  and with a `group()` closure. `r(N_units_minmovers_dropped)`,
+  `r(N_minmovers_dropped)` and `r(minmovers_iterations)` report the cost.
+- Certification: the four diagnostics against a pure-Stata reference and their
+  opt-in behaviour, `minmovers()` (whole units, fixed point, every retained
+  value at or above the threshold, monotonicity in #, determinism over 1/8
+  threads and shuffled rows, the emptying cascade, expected errors), and the
+  variance-decomposition table above with assertions on the ordering and the
+  magnitudes.
+- `help xsamplefe` has a new *Limited mobility bias* section; README has the
+  matching section and the option in the features table.
+
+### Cost, measured
+
+Interleaved A/B pairs against 1.1.0 rebuilt from `git show HEAD:`, `patents`
+(500,008 rows), `xsamplefe 10, absorb(id1 id2) numthreads(16)`, four warm
+repetitions per run, medians:
+
+| call | 1.1.0 | 1.2.0 | change |
+|---|---:|---:|---:|
+| default path (no diagnostics), 5 pairs | 0.1190 s | 0.1180 s | −0.8% |
+| `connected`, 4 pairs | 0.1425 s | 0.1410 s | −1.1% |
+| `connectivity`, 4 pairs | 0.1375 s | 0.1540 s | +12.0% |
+
+The default path and `connected` are unchanged, which is why the movers per
+mobility value are computed only for `connectivity` and `minmovers()`: those
+two now do more work than in 1.1.0 and cost about 17 ms more on the frame and
+5 ms on the sample of `patents` (`verbose` phases `frame connectivity` 16.5 ->
+33.6 ms, `sample connectivity` 6.1 -> 11.5 ms). The links are found with one
+small sort per unit over the existing unit-major row index, not one global
+sort of every (unit, mobility) pair, which was 25 percent slower again.
+
+The drawn samples are bit-identical to 1.1.0: 0 differing rows out of 516,810
+on `credit` and 500,008 on `patents` at `xsamplefe 10, absorb(id1 id2)`.
+
 ## Known limitations
 
 - The Windows static build (`--windows`, cross or native MSYS2) and the macOS
@@ -350,3 +436,8 @@ One-off run (not part of the certification) on this host:
   no longer `int(n*#/100+.5)`; they are reported.
 - The 2^31 guards were executed once (section above); they are not part of
   the certification because the datasets take minutes and tens of GB.
+- `minmovers()` prunes whole units, so it cascades; there is no version that
+  removes only the rows of a weak mobility value, because that would split
+  units and break the second invariant contract.
+- The connectivity diagnostics are not a leave-one-out connected set; for the
+  KSS-style corrections use `xhdfeconnected` from the `xhdfe` package.

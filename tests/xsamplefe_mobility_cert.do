@@ -358,7 +358,132 @@ assert gm == gb
 noi di as text "  mobstrata: identical to by(nmob) computed with !missing() (`sfinal' classes)"
 
 * ---------------------------------------------------------------------------
-* 5. Optional: the same diagnostics on the HDFE benchmark collection
+* 5. Movers per mobility value, and minmovers()
+*    The number of movers per firm is what drives the limited mobility bias of
+*    two-way fixed-effect estimates (Bonhomme, Lamadon and Manresa, JEP 2026),
+*    so it is reported for the frame and for the sample, and minmovers() can
+*    prune the mobility values that have too few.
+* ---------------------------------------------------------------------------
+* pure-Stata reference: movers per mobility value over the rows in memory
+capture program drop xcert_mpm
+program define xcert_mpm, rclass
+    syntax , unit(varname) mob(varname)
+    tempvar f nm mpm fm
+    quietly {
+        bysort `unit' `mob': gen byte `f' = _n == 1
+        bysort `unit': egen int `nm' = total(`f')
+        bysort `mob': egen int `mpm' = total(`f' & `nm' >= 2)
+        bysort `mob': gen byte `fm' = _n == 1
+        summarize `mpm' if `fm'
+        return scalar mean = r(mean)
+        count if `fm'
+        local nval = r(N)
+        count if `fm' & `mpm' <= 1
+        return scalar weak = r(N) / `nval'
+    }
+end
+
+webuse nlswork, clear
+drop if missing(ind_code)
+xcert_mpm, unit(idcode) mob(ind_code)
+local ref_mean = r(mean)
+local ref_weak = r(weak)
+xsamplefe 100, absorb(idcode ind_code) connectivity generate(gall)
+assert abs(r(movers_per_mob_frame) - `ref_mean') < 1e-12
+assert abs(r(weak_mob_share_frame) - `ref_weak') < 1e-12
+assert r(movers_per_mob) == r(movers_per_mob_frame)
+assert r(weak_mob_share) == r(weak_mob_share_frame)
+set seed 2
+xsamplefe 10, absorb(idcode ind_code) connectivity generate(g10)
+local s_mean = r(movers_per_mob)
+local s_weak = r(weak_mob_share)
+assert `s_mean' < `ref_mean' / 5
+preserve
+quietly keep if g10
+xcert_mpm, unit(idcode) mob(ind_code)
+assert abs(r(mean) - `s_mean') < 1e-12
+assert abs(r(weak) - `s_weak') < 1e-12
+restore
+* the statistic is part of the diagnostics: missing without them, and asking
+* for it never changes the draw
+set seed 2
+xsamplefe 10, absorb(idcode ind_code) generate(g10b)
+assert r(movers_per_mob) == . & r(weak_mob_share_frame) == .
+assert g10 == g10b
+* connected and reconnect need the components, not the movers per value, and
+* do not pay for them: the components are there, the movers statistics are not
+set seed 2
+xsamplefe 10, absorb(idcode ind_code) connected generate(g10c)
+assert r(N_components) < . & r(lcc_share) < .
+assert r(movers_per_mob) == . & r(weak_mob_share) == .
+noi di as text "  movers per mobility value: frame " %6.1f `ref_mean' " -> 10% sample " %6.1f `s_mean' ///
+    " (verified in Stata)"
+
+* minmovers(): prune the mobility values with fewer than # movers. Units are
+* indivisible, so every unit linked to a weak value goes, which can make other
+* values weak: the rule is iterated to a fixed point.
+xcert_akm
+tempfile mmpop
+save `mmpop'
+* a 10 percent unit sample leaves 17 percent of the firms with at most one
+* mover; minmovers(2) removes them and everything they drag with them
+set seed 1
+xsamplefe 10, absorb(worker firm year) connectivity generate(plain)
+assert r(N_units_sampled) == 300 & r(weak_mob_share) > .1
+use `mmpop', clear
+set seed 1
+xsamplefe 10, absorb(worker firm year) minmovers(2) generate(m2)
+assert r(N_units_sampled) == 300
+assert r(N_units_retained) == r(N_units_sampled) - r(N_units_minmovers_dropped)
+assert r(N_units_minmovers_dropped) > 0 & r(minmovers_iterations) >= 2
+assert r(weak_mob_share) == 0
+bysort worker: egen byte mn = min(m2)
+bysort worker: egen byte mx = max(m2)
+assert mn == mx
+* every retained mobility value really has two or more movers
+bysort worker firm: gen byte f = _n == 1 if m2
+bysort worker: egen int nm = total(f)
+bysort firm: egen int mv = total(f & nm >= 2)
+quietly count if m2 & mv < 2
+assert r(N) == 0
+* a larger threshold prunes more
+foreach k in 3 4 {
+    use `mmpop', clear
+    set seed 1
+    xsamplefe 20, absorb(worker firm year) minmovers(`k') generate(m`k')
+    assert r(weak_mob_share) == 0
+    local dropped`k' = r(N_units_minmovers_dropped)
+}
+assert `dropped3' < `dropped4'
+* deterministic: threads and row order
+use `mmpop', clear
+set seed 1
+xsamplefe 10, absorb(worker firm year) minmovers(2) generate(d1) numthreads(1)
+set seed 1
+xsamplefe 10, absorb(worker firm year) minmovers(2) generate(d8) numthreads(8)
+assert d1 == d8
+gen double __sh = runiform()
+sort __sh
+set seed 1
+xsamplefe 10, absorb(worker firm year) minmovers(2) generate(dsh)
+assert dsh == d1
+* the pruning cascades: a demanding threshold can empty the sample, and says so
+use `mmpop', clear
+set seed 1
+xsamplefe 10, absorb(worker firm year) minmovers(3) generate(m3)
+assert r(N_units_retained) == 0 & r(N_frame_retained) == 0
+assert m3 == 0
+* refused where a whole-unit rule cannot hold
+capture xsamplefe 20, absorb(worker firm year) minmovers(2) reconnect
+assert _rc == 198
+capture xsamplefe 20, unit(worker) minmovers(2)
+assert _rc == 198
+capture xsamplefe 20, absorb(worker firm year) minmovers(-1)
+assert _rc == 125
+noi di as text "  minmovers(): whole units, fixed point, cascade reported, expected errors"
+
+* ---------------------------------------------------------------------------
+* 6. Optional: the same diagnostics on the HDFE benchmark collection
 *    (only when XSF_SERGIO_DIR points at it; skipped otherwise)
 * ---------------------------------------------------------------------------
 local sergio : env XSF_SERGIO_DIR

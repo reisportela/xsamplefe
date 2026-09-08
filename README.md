@@ -20,6 +20,7 @@ no external dependencies.
 . xsamplefe 10, absorb(worker firm) mobstrata generate(s)     // proportional mobility classes, no rows deleted
 . xsamplefe 10, absorb(worker firm) connectivity              // how connected the frame and the sample are
 . xsamplefe 10, absorb(worker firm) reconnect                 // grow the largest component back (costs size)
+. xsamplefe 10, absorb(worker firm) minmovers(2)              // drop firms with fewer than 2 movers (cascades)
 ```
 
 ## Features
@@ -34,7 +35,7 @@ by varlist: xsamplefe # [, options]      same as by(varlist)
 | Main | `count`, `by(varlist)` (missing values form their own stratum), `generate(newvar)` / `keep(newvar)` indicator instead of deleting, `replace`, `seed(#)` |
 | Sampling unit | `absorb(absvars)` in `reghdfe` syntax (`i.`, `#`, `##`, `name=var`, `fe#c.x`; first entry = unit, first other entry = mobility dimension), `group(varname)`, `individual(varname)` / `i(varname)`, `unit(varname)` (numeric or string) |
 | Panel structure | `time(varname)` (default: the `xtset` time variable), `balanced`, `minperiods(#)`, `maxperiods(#)`, `minobs(#)`, `maxobs(#)` |
-| Mobility structure | `mobility(varname)`, `minmobility(#)`, `maxmobility(#)`, `movers(#)`, `stayers(#)`, `mobstrata`, `connectivity`, `connected`, `reconnect` / `recontarget(#)` / `reconrule(gain|key)` |
+| Mobility structure | `mobility(varname)`, `minmobility(#)`, `maxmobility(#)`, `movers(#)`, `stayers(#)`, `mobstrata`, `connectivity`, `connected`, `minmovers(#)`, `reconnect` / `recontarget(#)` / `reconrule(gain|key)` |
 | `if`/`in` and groups | `any`, `all` (units split by `if`/`in`; strict = error by default), `grouprule(any|all)` |
 | Performance | `numthreads(#)` (0 = runtime default; `r(threads_used)` reports the team formed), `verbose` (per-phase timings), `pduplicates(#)` (number of uniform key columns, as in `sample`) |
 
@@ -43,10 +44,10 @@ units in the frame / eligible / ineligible / sampled / retained / partially
 retained, movers eligible / sampled / retained, units split by `if`/`in`,
 strata, periods, mobility values covered, groups kept, the components of the
 unit-mobility graph on the frame and on the sample with the share of rows,
-units and mobility values in the largest one (with `connectivity`), what
-`reconnect` added, what
-`connected` dropped, thread diagnostics, `r(rngstate)` before drawing and the
-dimensions used. See `help xsamplefe` for the complete list and semantics.
+units and mobility values in the largest one, the movers per mobility value and
+the share of mobility values with at most one mover (all with `connectivity`),
+what `reconnect` added, what `minmovers()` and `connected` dropped, thread
+diagnostics, `r(rngstate)` before drawing and the dimensions used. See `help xsamplefe` for the complete list and semantics.
 
 ## Contract
 
@@ -101,10 +102,14 @@ price of over-representing movers. `tests/xsamplefe_mobility_cert.do` and
 `connectivity` reports the components of the bipartite unit-mobility graph on
 the eligible frame and on the final sample: `r(N_components_frame)`,
 `r(lcc_share_frame)`, `r(N_components)`, `r(lcc_share)`, `r(lcc_units_share)`,
-`r(lcc_mobility_share)` and `r(N_units_lcc_kept)`. It is opt-in — each graph
-costs a serial union-find over every frame row — and `connected` and
-`reconnect`, which need the same graphs, report them too; without one of the
-three the seven results are missing.
+`r(lcc_mobility_share)` and `r(N_units_lcc_kept)`. It also reports the movers
+per mobility value, `r(movers_per_mob_frame)` and `r(movers_per_mob)`, and the
+share of mobility values with at most one mover, `r(weak_mob_share_frame)` and
+`r(weak_mob_share)`. It is opt-in — each graph costs a serial union-find over
+every frame row. `connected`, `reconnect` and `minmovers()` build the same
+graphs and report the components without the option; the movers per mobility
+value cost one further pass, so only `connectivity` and `minmovers()` compute
+them.
 
 Keeping whole units preserves the mobility of each unit but not the network: on
 `patents` the largest component covers 76.0% of the frame rows and 0.8% of the
@@ -158,6 +163,39 @@ whole frontier, so the per-stratum counts stop being exact and
 stratum. All of it is reported, not hidden.
 
 See `help xsamplefe` for the full syntax, semantics and stored results.
+
+## Limited mobility bias
+
+Whole-unit sampling keeps the *parameters* of the population, not the
+*precision* of a two-way fixed-effect estimator. AKM firm effects are unbiased
+one by one, but each carries noise that inflates `Var(psi_hat)` and depresses
+`Cov(alpha_hat, psi_hat)`, and the size of that bias is governed by the movers
+per firm — exactly what a sample takes away (Bonhomme, Lamadon and Manresa,
+"The ABC of AKM", *Journal of Economic Perspectives*, 2026). On their
+calibrated panel (6,000 workers, 300 firms, 5 periods), each design estimated
+on its own connected set:
+
+| design | rows | movers/firm | Var(psi) true | Var(psi) AKM | 2Cov true | 2Cov AKM |
+|---|---:|---:|---:|---:|---:|---:|
+| population | 30,000 | 30.3 | 0.096 | 0.101 | 0.190 | 0.182 |
+| 25% of workers | 7,500 | 7.7 | 0.097 | 0.116 | 0.190 | 0.157 |
+| 10% of workers | 2,925 | 3.2 | 0.098 | 0.166 | 0.196 | 0.109 |
+| 10% of rows (`sample`) | 1,738 | 2.1 | 0.087 | 0.440 | 0.177 | −0.338 |
+| `movers(100) stayers(10)` | 19,735 | 30.3 | 0.089 | 0.093 | 0.139 | 0.133 |
+
+The true columns barely move: the draw is faithful. The AKM columns do: the
+estimated `Var(psi)` is 5% above the truth on the full data, 20% at a quarter
+of the workers, 70% at a tenth, and five times the truth when the same number
+of *rows* is drawn instead of units, with a covariance that changes sign. So a
+unit sample is fine for coefficients on covariates, and for a variance
+decomposition you should keep every mover (`movers(100) stayers(#)`), which
+restores an unbiased decomposition of a *different* population. `minmovers(#)`
+drops the mobility values with fewer than `#` movers and the units linked to
+them, iterating to a fixed point; it removes the noisiest firms but not the
+bias, and because units are indivisible the pruning cascades and can empty the
+sample (`minmovers(2)` drops 46 of 300 units on that panel, `minmovers(3)`
+leaves nothing and says so). `tests/xsamplefe_estimation_cert.do` fixes these
+numbers.
 
 ## Install
 

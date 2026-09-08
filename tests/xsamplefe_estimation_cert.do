@@ -136,4 +136,136 @@ assert abs(_b[age] - `ba_full') < 3 * _se[age]
 noi di as text "  nlswork 30% of idcode: tenure " %8.5f _b[tenure] " (full " %8.5f `bt_full' ///
     "), age " %8.5f _b[age] " (full " %8.5f `ba_full' ")"
 
+* ---------------------------------------------------------------------------
+* 4. AKM variance decomposition: what a sample does and does not reproduce
+*    DGP of Bonhomme, Lamadon and Manresa ("The ABC of AKM", JEP 2026):
+*    homophily mobility (logit in the squared distance between the worker type
+*    and the firm effect) with their calibrated parameters (lambda = .559,
+*    rho = .351, sigma = .369, s_alpha = .550, s_psi = .317, 10 worker groups).
+*    Sampling is faithful: the *true* decomposition of the sample equals the
+*    population's. The AKM *estimator* is not: its upward bias on Var(psi)
+*    grows as the movers per firm fall, which is what sampling takes away.
+* ---------------------------------------------------------------------------
+capture program drop xcert_lamadon
+program define xcert_lamadon
+    syntax , workers(integer) firms(integer) periods(integer) [burn(integer 15) seed(integer 6344)]
+    clear
+    set seed `seed'
+    set obs `workers'
+    gen long worker = _n
+    gen int g = ceil(runiform() * 10)
+    gen double alpha_g = .550 * invnormal((g - .5) / 10)
+    gen double alpha = alpha_g + rnormal(0, .550)
+    gen int firm = ceil(runiform() * `firms')
+    gen double psi = .317 * invnormal((firm - .5) / `firms')
+    local files
+    forvalues t = 1/`=`burn' + `periods'' {
+        gen int f2 = ceil(runiform() * `firms')
+        gen double psi2 = .317 * invnormal((f2 - .5) / `firms')
+        gen double pr = .559 / (1 + exp((1 / .351) * ((psi2 - alpha_g)^2 - (psi - alpha_g)^2)))
+        replace firm = f2 if firm != f2 & runiform() < pr
+        replace psi = .317 * invnormal((firm - .5) / `firms')
+        drop f2 psi2 pr
+        if (`t' > `burn') {
+            preserve
+            gen int year = `t' - `burn'
+            keep worker firm year alpha psi
+            tempfile f`t'
+            save `f`t''
+            local files `files' `f`t''
+            restore
+        }
+    }
+    clear
+    foreach f of local files {
+        append using `f'
+    }
+    gen double y = alpha + psi + rnormal(0, .369)
+    sort worker year
+end
+
+* decomposition of whatever is in memory, on its own connected set (AKM effects
+* are only comparable within a component)
+capture program drop xcert_vardec
+program define xcert_vardec, rclass
+    syntax , tag(string)
+    quietly {
+        xsamplefe 100, unit(worker) mobility(firm) connected connectivity generate(__lcc)
+        local mpm = r(movers_per_mob)
+        local weak = r(weak_mob_share)
+        keep if __lcc
+        capture drop a_hat p_hat
+        reghdfe y, absorb(a_hat = worker p_hat = firm)
+        summarize psi
+        local vp = r(Var)
+        summarize p_hat
+        local vph = r(Var)
+        correlate alpha psi, covariance
+        local cov = r(cov_12)
+        correlate a_hat p_hat, covariance
+        local covh = r(cov_12)
+    }
+    noi di as text "  " %-22s "`tag'" " N " %8.0fc _N " movers/firm " %6.1f `mpm' ///
+        "  Var(psi) true " %6.3f `vp' " AKM " %6.3f `vph' " ratio " %5.3f `vph'/`vp' ///
+        "  2Cov true " %6.3f 2*`cov' " AKM " %7.3f 2*`covh'
+    return scalar vp = `vp'
+    return scalar cov2 = 2*`cov'
+    return scalar ratio = `vph'/`vp'
+    return scalar cov2_hat = 2*`covh'
+    return scalar mpm = `mpm'
+    return scalar weak = `weak'
+end
+
+xcert_lamadon, workers(6000) firms(300) periods(5)
+assert _N == 30000
+tempfile lam
+save `lam'
+xcert_vardec, tag("population")
+local vp_pop = r(vp)
+local cov_pop = r(cov2)
+local ratio_pop = r(ratio)
+local mpm_pop = r(mpm)
+assert `ratio_pop' < 1.15
+assert r(weak) == 0
+
+foreach p in 25 10 {
+    use `lam', clear
+    set seed 1
+    quietly xsamplefe `p', absorb(worker firm year) generate(s)
+    quietly keep if s
+    xcert_vardec, tag("`p'% of workers")
+    local ratio`p' = r(ratio)
+    local mpm`p' = r(mpm)
+    local weak`p' = r(weak)
+    * the sample keeps the population parameters: this is the sampling contract
+    assert abs(r(vp) / `vp_pop' - 1) < .10
+    assert abs(r(cov2) / `cov_pop' - 1) < .10
+}
+* the estimator degrades with the movers per firm
+assert `mpm_pop' > `mpm25' & `mpm25' > `mpm10'
+assert `ratio_pop' < `ratio25' & `ratio25' < `ratio10'
+assert inrange(`ratio25', 1.05, 1.45) & inrange(`ratio10', 1.35, 2.20)
+assert `weak10' > .10
+
+* observation-level sampling of the same size is far worse and even flips the
+* sign of the covariance
+use `lam', clear
+set seed 1
+quietly sample 10
+xcert_vardec, tag("10% of rows")
+assert r(mpm) < `mpm10'
+assert r(ratio) > 3 & r(ratio) > `ratio10'
+assert r(cov2_hat) < 0
+
+* keeping every mover restores an unbiased decomposition, of a different
+* population: the estimand moves with the design
+use `lam', clear
+set seed 1
+quietly xsamplefe 10, absorb(worker firm year) movers(100) stayers(10) generate(s)
+quietly keep if s
+xcert_vardec, tag("movers(100) stayers(10)")
+assert r(ratio) < 1.15
+assert abs(r(cov2) / `cov_pop' - 1) > .20
+noi di as text "  AKM decomposition: sampling keeps the parameters, the estimator loses precision"
+
 noi di as text "xsamplefe estimation certification passed"

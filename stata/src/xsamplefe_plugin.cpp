@@ -265,6 +265,7 @@ struct Config {
     double rate_movers = 0.0, rate_stayers = 0.0;
     bool mobstrata = false;
     bool connectivity = false;
+    long long minmovers = -1;
     bool reconnect = false;
     ReconRule recon_rule = ReconRule::Gain;
     double recon_target = -1.0;  // percent; < 0 = the frame's largest-component share
@@ -332,6 +333,7 @@ Config parse_config(const ParsedArgs& a) {
     }
     if (auto v = a.optional("mobstrata")) c.mobstrata = parse_bool(*v, "mobstrata");
     if (auto v = a.optional("connectivity")) c.connectivity = parse_bool(*v, "connectivity");
+    if (auto v = a.optional("minmovers")) c.minmovers = parse_ll(*v, "minmovers");
     if (auto v = a.optional("reconnect")) c.reconnect = parse_bool(*v, "reconnect");
     if (auto v = a.optional("recon_rule")) c.recon_rule = parse_recon_rule(*v);
     if (auto v = a.optional("recon_target")) c.recon_target = parse_double(*v, "recon_target");
@@ -345,13 +347,15 @@ Config parse_config(const ParsedArgs& a) {
         fail("balanced/minperiods()/maxperiods() require a time dimension");
     }
     if ((c.minmob >= 0 || c.maxmob >= 0 || c.has_rate_movers || c.has_rate_stayers || c.connected ||
-         c.reconnect || c.mobstrata || c.connectivity) &&
+         c.reconnect || c.mobstrata || c.connectivity || c.minmovers >= 0) &&
         !c.has_mob) {
-        fail("minmobility()/maxmobility()/movers()/stayers()/mobstrata/connectivity/connected/reconnect "
-             "require a mobility dimension");
+        fail("minmobility()/maxmobility()/movers()/stayers()/mobstrata/connectivity/connected/reconnect/"
+             "minmovers() require a mobility dimension");
     }
     if (c.has_group && !c.has_unit) fail("group closure requires a sampling unit");
     if (c.reconnect && c.has_group) fail("reconnect may not be combined with a group() closure");
+    if (c.minmovers >= 0 && c.has_group) fail("minmovers() may not be combined with a group() closure");
+    if (c.minmovers >= 0 && c.reconnect) fail("minmovers() may not be combined with reconnect");
     for (double r : {c.rate_movers, c.rate_stayers}) {
         if (c.is_count) {
             if (r < 0.0 || std::floor(r) != r) fail("movers()/stayers() counts must be nonnegative integers");
@@ -954,10 +958,72 @@ STDLL stata_call(int argc, char* argv[]) {
             return cs;
         };
 
+        // Movers per mobility value. This is the statistic that drives the
+        // limited mobility bias of two-way fixed-effect estimates: the fewer
+        // movers a firm has, the noisier its estimated effect, and the noise
+        // inflates Var(psi) (Bonhomme, Lamadon and Manresa, JEP 2026). Over
+        // the masked rows a unit is a mover when it is linked to two or more
+        // distinct mobility values, and every mobility value present counts
+        // the distinct mover units linked to it.
+        struct MobStats {
+            int64_t values = 0;  // mobility values present in the mask
+            int64_t weak = 0;    // values linked to at most one mover
+            double mean_movers = 0.0;
+        };
+        std::vector<int32_t> mob_nmob;               // per unit, inside the mask
+        std::vector<int32_t> mob_movers, mob_units;  // per mobility value
+        std::vector<int32_t> mob_buf;
+        auto analyse_mobility = [&](const std::vector<uint8_t>& rowmask) {
+            mob_nmob.assign(static_cast<std::size_t>(U), 0);
+            mob_movers.assign(static_cast<std::size_t>(M), 0);
+            mob_units.assign(static_cast<std::size_t>(M), 0);
+            // the frame rows are already grouped by unit, so the distinct
+            // links are found with one small sort per unit
+            for (int64_t u = 0; u < U; ++u) {
+                const std::size_t uu = static_cast<std::size_t>(u);
+                const int64_t lo = ucsr.off[uu];
+                const int64_t hi = ucsr.off[uu + 1];
+                mob_buf.clear();
+                for (int64_t k = lo; k < hi; ++k) {
+                    const int32_t row = ucsr.rows[static_cast<std::size_t>(k)];
+                    if (!rowmask[static_cast<std::size_t>(row)]) continue;
+                    if (mob_id[static_cast<std::size_t>(row)] < 0) continue;
+                    mob_buf.push_back(mob_id[static_cast<std::size_t>(row)]);
+                }
+                if (mob_buf.empty()) continue;
+                std::sort(mob_buf.begin(), mob_buf.end());
+                mob_buf.erase(std::unique(mob_buf.begin(), mob_buf.end()), mob_buf.end());
+                const int32_t d = static_cast<int32_t>(mob_buf.size());
+                mob_nmob[uu] = d;
+                for (const int32_t m : mob_buf) {
+                    const std::size_t mm = static_cast<std::size_t>(m);
+                    ++mob_units[mm];
+                    if (d >= 2) ++mob_movers[mm];
+                }
+            }
+            MobStats ms;
+            int64_t total = 0;
+            for (int64_t m = 0; m < M; ++m) {
+                const std::size_t mm = static_cast<std::size_t>(m);
+                if (mob_units[mm] <= 0) continue;
+                ++ms.values;
+                total += mob_movers[mm];
+                if (mob_movers[mm] <= 1) ++ms.weak;
+            }
+            ms.mean_movers =
+                ms.values > 0 ? static_cast<double>(total) / static_cast<double>(ms.values) : 0.0;
+            return ms;
+        };
+
         // the graph passes cost a full union-find over the rows, so they run
         // only when their result is asked for
-        const bool diag = cfg.connectivity || cfg.reconnect || cfg.connected;
+        const bool diag = cfg.connectivity || cfg.reconnect || cfg.connected || cfg.minmovers >= 0;
+        // the movers per mobility value cost one more pass over the frame rows,
+        // so connected and reconnect, which only need the components, do not pay
+        // for them: they are computed for connectivity and for minmovers()
+        const bool mobdiag = cfg.connectivity || cfg.minmovers >= 0;
         CompStats frame_cs;
+        MobStats frame_ms;
         std::vector<uint8_t> u_lcc_frame;
         if (diag && cfg.has_mob && n_frame > 0) {
             std::vector<uint8_t> rowmask(static_cast<std::size_t>(n), 0);
@@ -967,6 +1033,7 @@ STDLL stata_call(int argc, char* argv[]) {
             }
             UnionFind uf(U + M);
             frame_cs = analyse_graph(rowmask, uf, &u_lcc_frame);
+            if (mobdiag) frame_ms = analyse_mobility(rowmask);
             timer.mark("frame connectivity");
         }
 
@@ -1247,29 +1314,81 @@ STDLL stata_call(int argc, char* argv[]) {
             timer.mark("reconnect");
         }
 
+        // ---- pruning: minmovers() and connected -----------------------------
+        // Units are indivisible, so a mobility value with too few movers is
+        // removed by dropping every unit linked to it, which can turn other
+        // units into stayers and other mobility values weak: the two rules are
+        // iterated to a joint fixed point. With connected alone the block is a
+        // single pass, exactly as before.
         int64_t N_connected_dropped = 0;
         int64_t n_components = 0;
-        if (cfg.connected && n_frame > 0) {
+        int64_t N_minmovers_dropped = 0, U_minmovers_dropped = 0, prune_iters = 0;
+        if ((cfg.connected || cfg.minmovers >= 0) && n_frame > 0) {
             std::vector<uint8_t> rowmask(static_cast<std::size_t>(n), 0);
-            for (int64_t i = 0; i < n; ++i) {
-                const std::size_t ii = static_cast<std::size_t>(i);
-                rowmask[ii] = (frame[ii] && keep[ii]) ? 1 : 0;
-            }
-            UnionFind uf(U + M);
-            const CompStats cs = analyse_graph(rowmask, uf, nullptr);
-            n_components = cs.ncomp;
-            for (int64_t i = 0; i < n; ++i) {
-                const std::size_t ii = static_cast<std::size_t>(i);
-                if (!rowmask[ii]) continue;
-                if (uf.find(unit_id[ii]) != cs.lcc_root) {
-                    keep[ii] = 0;
-                    ++N_connected_dropped;
+            std::vector<uint8_t> drop_unit(static_cast<std::size_t>(U), 0);
+            bool first_components = true;
+            while (true) {
+                bool changed = false;
+                if (cfg.minmovers >= 0) {
+                    for (int64_t i = 0; i < n; ++i) {
+                        const std::size_t ii = static_cast<std::size_t>(i);
+                        rowmask[ii] = (frame[ii] && keep[ii]) ? 1 : 0;
+                    }
+                    analyse_mobility(rowmask);
+                    std::fill(drop_unit.begin(), drop_unit.end(), 0);
+                    int64_t weak_units = 0;
+                    for (int64_t i = 0; i < n; ++i) {
+                        const std::size_t ii = static_cast<std::size_t>(i);
+                        if (!rowmask[ii] || mob_id[ii] < 0) continue;
+                        if (mob_movers[static_cast<std::size_t>(mob_id[ii])] >= cfg.minmovers) continue;
+                        uint8_t& d = drop_unit[static_cast<std::size_t>(unit_id[ii])];
+                        if (!d) {
+                            d = 1;
+                            ++weak_units;
+                        }
+                    }
+                    if (weak_units > 0) {
+                        for (int64_t i = 0; i < n; ++i) {
+                            const std::size_t ii = static_cast<std::size_t>(i);
+                            if (!rowmask[ii]) continue;
+                            if (!drop_unit[static_cast<std::size_t>(unit_id[ii])]) continue;
+                            keep[ii] = 0;
+                            ++N_minmovers_dropped;
+                        }
+                        U_minmovers_dropped += weak_units;
+                        changed = true;
+                    }
                 }
+                if (cfg.connected) {
+                    for (int64_t i = 0; i < n; ++i) {
+                        const std::size_t ii = static_cast<std::size_t>(i);
+                        rowmask[ii] = (frame[ii] && keep[ii]) ? 1 : 0;
+                    }
+                    UnionFind uf(U + M);
+                    const CompStats cs = analyse_graph(rowmask, uf, nullptr);
+                    if (first_components) {
+                        n_components = cs.ncomp;
+                        first_components = false;
+                    }
+                    for (int64_t i = 0; i < n; ++i) {
+                        const std::size_t ii = static_cast<std::size_t>(i);
+                        if (!rowmask[ii]) continue;
+                        if (uf.find(unit_id[ii]) != cs.lcc_root) {
+                            keep[ii] = 0;
+                            ++N_connected_dropped;
+                            changed = true;
+                        }
+                    }
+                }
+                ++prune_iters;
+                if (!changed || cfg.minmovers < 0) break;
+                if (prune_iters > 10000) fail("minmovers()/connected pruning did not converge");
             }
-            timer.mark("connected set");
+            timer.mark(cfg.minmovers >= 0 ? "minmovers/connected" : "connected set");
         }
 
         CompStats sample_cs;
+        MobStats sample_ms;
         int64_t U_lcc_kept = 0;
         if (diag && cfg.has_mob && n_frame > 0) {
             std::vector<uint8_t> rowmask(static_cast<std::size_t>(n), 0);
@@ -1280,6 +1399,7 @@ STDLL stata_call(int argc, char* argv[]) {
             UnionFind uf(U + M);
             std::vector<uint8_t> u_lcc_sample;
             sample_cs = analyse_graph(rowmask, uf, &u_lcc_sample);
+            if (mobdiag) sample_ms = analyse_mobility(rowmask);
             for (int64_t u = 0; u < U; ++u) {
                 const std::size_t uu = static_cast<std::size_t>(u);
                 if (u_lcc_sample[uu] && !u_lcc_frame.empty() && u_lcc_frame[uu]) ++U_lcc_kept;
@@ -1373,8 +1493,25 @@ STDLL stata_call(int argc, char* argv[]) {
         save_scalar(p + "LCC_units_share", has_diag ? share_units : SV_missval);
         save_scalar(p + "LCC_mob_share", has_diag ? share_mobs : SV_missval);
         save_scalar(p + "U_lcc_kept", has_diag ? static_cast<double>(U_lcc_kept) : SV_missval);
+        const bool has_mobdiag = mobdiag && cfg.has_mob;
+        save_scalar(p + "MPM_frame", has_mobdiag ? frame_ms.mean_movers : SV_missval);
+        save_scalar(p + "MPM_sample", has_mobdiag ? sample_ms.mean_movers : SV_missval);
+        save_scalar(p + "WEAK_frame",
+                    has_mobdiag && frame_ms.values > 0
+                        ? static_cast<double>(frame_ms.weak) / static_cast<double>(frame_ms.values)
+                        : (has_mobdiag ? 0.0 : SV_missval));
+        save_scalar(p + "WEAK_sample",
+                    has_mobdiag && sample_ms.values > 0
+                        ? static_cast<double>(sample_ms.weak) / static_cast<double>(sample_ms.values)
+                        : (has_mobdiag ? 0.0 : SV_missval));
         save_scalar(p + "U_reconnected", cfg.reconnect ? static_cast<double>(U_reconnected) : SV_missval);
         save_scalar(p + "N_reconnected", cfg.reconnect ? static_cast<double>(N_reconnected) : SV_missval);
+        save_scalar(p + "U_minmovers_dropped",
+                    cfg.minmovers >= 0 ? static_cast<double>(U_minmovers_dropped) : SV_missval);
+        save_scalar(p + "N_minmovers_dropped",
+                    cfg.minmovers >= 0 ? static_cast<double>(N_minmovers_dropped) : SV_missval);
+        save_scalar(p + "minmovers_iterations",
+                    cfg.minmovers >= 0 ? static_cast<double>(prune_iters) : SV_missval);
         save_scalar(p + "threads_requested", static_cast<double>(cfg.num_threads));
         save_scalar(p + "threads_effective", static_cast<double>(effective_threads()));
         save_scalar(p + "threads_used", static_cast<double>(ts.max_team));
