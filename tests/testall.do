@@ -5,6 +5,7 @@
 version 16
 clear all
 set more off
+set varabbrev off
 set linesize 120
 capture log close _all
 
@@ -18,6 +19,8 @@ if (`"`adopath'"' == "") {
 }
 
 local xhdfe_adopath : env XHDFE_ADOPATH
+local fixture_dir : env XSAMPLEFE_FIXTURE_DIR
+if (`"`fixture_dir'"' != "") global S_WEB `"`fixture_dir'"'
 
 discard
 if (`"`xhdfe_adopath'"' != "") adopath ++ `"`xhdfe_adopath'"'
@@ -68,6 +71,9 @@ di as text _n "{hline 72}"
 di as text "Running xsamplefe_mobility_cert.do"
 di as text "{hline 72}"
 do "`testdir'/xsamplefe_mobility_cert.do"
+
+do "`testdir'/xsamplefe_adversarial_cert.do"
+do "`testdir'/xsamplefe_binding_cert.do"
 
 di as text _n "{hline 72}"
 di as text "XSAMPLEFE CERTIFICATION TESTS COMPLETED SUCCESSFULLY"

@@ -1,0 +1,106 @@
+name: Build release assets
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.platform == 'linux64' && 'almalinux:9' || null }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux64
+            os: ubuntu-22.04
+            target: --linux
+          - platform: win64
+            os: windows-2022
+            target: --windows
+          - platform: macintel64
+            os: macos-15-intel
+            target: --macos-intel
+          - platform: macarm64
+            os: macos-14
+            target: --macos-arm64
+    steps:
+      - name: Linux toolchain matching the validation host
+        if: matrix.platform == 'linux64'
+        run: dnf -y install gcc-c++ python3 git binutils
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Windows compiler
+        if: matrix.platform == 'win64'
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-python
+      - name: Mac OpenMP runtime
+        if: startsWith(matrix.platform, 'mac')
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: brew install libomp
+      - name: Build and test Unix plugin
+        if: matrix.platform != 'win64'
+        shell: bash
+        env:
+          OMP_NUM_THREADS: 2
+          PLATFORM: ${{ matrix.platform }}
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bash stata/tools/build-xsamplefe-plugin.sh "$BUILD_TARGET" --openmp --no-march-native
+          python3 stata/tools/prepare-platform-assets.py --platform "$PLATFORM" --output out
+          if [[ "$PLATFORM" == linux64 ]]; then
+            g++ -std=c++17 -O2 -DSYSTEM=OPUNIX -Istata/tools/_deps tests/plugin_smoke.cpp -ldl -o out/plugin_smoke
+          else
+            clang++ -std=c++17 -O2 -DSYSTEM=APPLEMAC -Istata/tools/_deps tests/plugin_smoke.cpp -o out/plugin_smoke
+          fi
+          out/plugin_smoke "$PWD/out/xsamplefe_${PLATFORM}.plugin" | tee out/native_spi.txt
+          python3 tests/test_build_script.py
+      - name: Build and test Windows plugin
+        if: matrix.platform == 'win64'
+        shell: msys2 {0}
+        env:
+          OMP_NUM_THREADS: 2
+        run: |
+          set -euo pipefail
+          bash stata/tools/build-xsamplefe-plugin.sh --windows --openmp --no-march-native
+          python stata/tools/prepare-platform-assets.py --platform win64 --output out
+          g++ -std=c++17 -O2 -DSYSTEM=STWIN32 -Istata/tools/_deps tests/plugin_smoke.cpp -static -static-libgcc -static-libstdc++ -o out/plugin_smoke.exe
+          out/plugin_smoke.exe "$PWD/out/xsamplefe_win64.plugin" | tee out/native_spi.txt
+      - name: Upload exact tested native files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: xsamplefe-${{ matrix.platform }}
+          path: |
+            out/*.plugin
+            out/*.dylib
+            out/*_license.txt
+            out/*_build.json
+            out/native_spi.txt
+          if-no-files-found: error
+  package:
+    needs: native
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: xsamplefe-*
+          path: native
+      - name: Assemble release installation and ZIP
+        run: python3 stata/tools/assemble-release.py --artifacts native --output release_out
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: xsamplefe-release-assets
+          path: release_out/*
+          if-no-files-found: error

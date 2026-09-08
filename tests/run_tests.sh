@@ -11,6 +11,8 @@
 #                                      Used by tests/selftest.sh, which checks that
 #                                      this script reports a failing certification.
 # Requires reghdfe and sample2 (net install dm46, from(http://www.stata.com/stb/stb37)).
+# XSAMPLEFE_FIXTURE_DIR may contain nlswork.dta for offline certification.
+# XSAMPLEFE_TEST_OUTDIR selects a new output directory; an existing log is refused.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,7 +32,8 @@ fi
 
 if [[ "${XSAMPLEFE_BUILD_PLUGIN:-0}" == "1" ]]; then
   # shellcheck disable=SC2086
-  bash "${REPO_ROOT}/stata/tools/build-xsamplefe-plugin.sh" ${XSAMPLEFE_BUILD_ARGS:-}
+  bash "${REPO_ROOT}/stata/tools/build-xsamplefe-plugin.sh" ${XSAMPLEFE_BUILD_ARGS:-} \
+    --output "${REPO_ROOT}/stata/xsamplefe.plugin"
 fi
 
 # Help lint: Stata's GUI Viewer truncates SMCL source lines at 245 characters
@@ -58,17 +61,34 @@ if [[ -z "${XHDFE_ADOPATH:-}" && -f "${REPO_ROOT}/../xhdfe/stata/xhdfe.ado" ]]; 
 fi
 export XHDFE_ADOPATH="${XHDFE_ADOPATH:-}"
 
-OUT_DIR="${SCRIPT_DIR}/output"
+if [[ -n "${XSAMPLEFE_TEST_OUTDIR:-}" ]]; then
+  OUT_DIR="${XSAMPLEFE_TEST_OUTDIR}"
+else
+  mkdir -p "${SCRIPT_DIR}/output"
+  OUT_DIR="$(mktemp -d "${SCRIPT_DIR}/output/cert_XXXXXXXX")"
+fi
 mkdir -p "${OUT_DIR}"
+OUT_DIR="$(cd -- "${OUT_DIR}" && pwd)"
+LOG_FILE="${OUT_DIR}/testall.log"
+if [[ -e "${LOG_FILE}" ]]; then
+  echo "Refusing to overwrite or reuse an existing certification log: ${LOG_FILE}" >&2
+  exit 1
+fi
+if [[ -e "${OUT_DIR}/testall.do" ]]; then
+  echo "Refusing to overwrite an existing test driver: ${OUT_DIR}/testall.do" >&2
+  exit 1
+fi
+cp "${SCRIPT_DIR}/testall.do" "${OUT_DIR}/testall.do"
+echo "xsamplefe certification log: ${LOG_FILE}"
+export XSAMPLEFE_TEST_OUTDIR="${OUT_DIR}"
 (
   cd "${OUT_DIR}"
-  "${STATA_BIN}" -b do "${SCRIPT_DIR}/testall.do"
+  "${STATA_BIN}" -b do testall.do
 )
 
-LOG_FILE="${OUT_DIR}/testall.log"
-if ! grep -q "XSAMPLEFE CERTIFICATION TESTS COMPLETED SUCCESSFULLY" "${LOG_FILE}"; then
+if [[ ! -f "${LOG_FILE}" ]] || ! grep -Fxq "XSAMPLEFE CERTIFICATION TESTS COMPLETED SUCCESSFULLY" "${LOG_FILE}"; then
   echo "xsamplefe certification failed. Last log lines:" >&2
-  tail -n 60 "${LOG_FILE}" >&2
+  if [[ -f "${LOG_FILE}" ]]; then tail -n 60 "${LOG_FILE}" >&2; fi
   exit 1
 fi
 echo "xsamplefe certification passed (${LOG_FILE})"

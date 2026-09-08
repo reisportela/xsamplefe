@@ -1,4 +1,4 @@
-*! version 1.2.0  08sep2026
+*! version 1.2.3  09sep2026
 *! xsamplefe: panel / fixed-effect aware random sampling for reghdfe and xhdfe
 *! - sample / sample2 semantics for the simple cases (drawn rows are
 *!   bit-identical to sample under the same seed and data order)
@@ -163,6 +163,10 @@ program define xsamplefe, rclass byable(onecall)
             local ch = substr("`absorb_raw'", `j', 1)
             if ("`ch'" == "(") local ++depth
             if ("`ch'" == ")") local --depth
+            if (`depth' < 0) {
+                di as err "absorb(): unbalanced parentheses"
+                exit 198
+            }
             if ("`ch'" == " " & `depth' == 0) {
                 if ("`cur'" != "") {
                     local ++nterm
@@ -170,7 +174,11 @@ program define xsamplefe, rclass byable(onecall)
                 }
                 local cur
             }
-            else local cur `cur'`ch'
+            else local cur `"`cur'`ch'"'
+        }
+        if (`depth' != 0) {
+            di as err "absorb(): unbalanced parentheses"
+            exit 198
         }
         if ("`cur'" != "") {
             local ++nterm
@@ -189,20 +197,46 @@ program define xsamplefe, rclass byable(onecall)
                     di as err "absorb(): unbalanced parentheses in `term`t''"
                     exit 198
                 }
+                local before = substr("`tok'", 1, `p' - 1)
+                local slopes = substr("`tok'", `p' + 1, `q' - `p' - 1)
+                if (substr("`before'", -2, 2) == "c.") {
+                    unab slopes : `slopes'
+                    confirm numeric variable `slopes'
+                }
+                else if (substr("`before'", -1, 1) == "#") {
+                    foreach slope of local slopes {
+                        if (substr("`slope'", 1, 2) != "c.") {
+                            di as err "absorb(): parenthesised lists must contain continuous slopes"
+                            exit 198
+                        }
+                        local slope = substr("`slope'", 3, .)
+                        unab slope : `slope'
+                        confirm numeric variable `slope'
+                    }
+                }
+                else {
+                    di as err "absorb(): parentheses are supported only for continuous slope lists"
+                    exit 198
+                }
                 local tok = substr("`tok'", 1, `p' - 1) + substr("`tok'", `q' + 1, .)
             }
             local tok = subinstr("`tok'", "i.", "", .)
             local tok = subinstr("`tok'", "##", "#", .)
             local parts = subinstr("`tok'", "#", " ", .)
+            local interaction = strpos("`tok'", "#") > 0
             local fevars
             foreach p of local parts {
                 if (substr("`p'", 1, 2) == "c.") continue
                 unab p : `p'
+                if (`interaction' & `: word count `p'' > 1) {
+                    di as err "absorb(): each categorical part of an interaction must name one variable"
+                    exit 198
+                }
                 local fevars `fevars' `p'
             }
             local nfev : word count `fevars'
             if (`nfev' == 0) continue
-            if (`nfev' == 1) {
+            if (`nfev' == 1 | !`interaction') {
                 local absvars `absvars' `fevars'
                 local absvars_display `absvars_display' `fevars'
             }
@@ -230,6 +264,14 @@ program define xsamplefe, rclass byable(onecall)
         local unit_display : word 1 of `absvars_display'
     }
     local has_unit = ("`unit'" != "")
+    if (!`has_unit' & `"`absorb'"' != "") {
+        di as err "absorb() has no categorical sampling dimension; specify unit() or group()"
+        exit 198
+    }
+    if (!`has_unit' & (`minobs' >= 0 | `maxobs' >= 0)) {
+        di as err "minobs() and maxobs() require unit(), absorb() or group()"
+        exit 198
+    }
 
     local block
     if ("`group'" != "" & "`group'" != "`unit'") local block `group'
@@ -382,7 +424,11 @@ program define xsamplefe, rclass byable(onecall)
     tempname pfx
     local sp `pfx'_
     local cfg "cfg=is_count=`is_count';"
-    if (`is_count') local cfg "`cfg'count=`exp';"
+    if (`is_count') {
+        // No stratum can exceed _N; saturate before the plugin's integer parser.
+        local count_plugin : display %21.0f min(`exp', _N)
+        local cfg "`cfg'count=`count_plugin';"
+    }
     else local cfg "`cfg'pct=`exp';"
     local cfg "`cfg'has_unit=`has_unit';nby=`nby';has_time=`has_time';has_mob=`has_mob';"
     local cfg "`cfg'has_group=`has_block';nu=`nu';frame_rule=`frame_rule';group_rule=`grouprule';"
@@ -413,18 +459,24 @@ program define xsamplefe, rclass byable(onecall)
     capture confirm file "`plugin_path'"
     if (_rc) {
         di as err "xsamplefe.plugin not found next to xsamplefe.ado; build it with stata/tools/build-xsamplefe-plugin.sh"
-        exit _rc
+        quietly set rngstate `rngstate'
+        exit 601
     }
     local plugin_prog "__xsamplefe_plugin"
-    if ("$XSAMPLEFE_PLUGIN_PATH_INTERNAL" != "" & "$XSAMPLEFE_PLUGIN_PATH_INTERNAL" != "`plugin_path'") {
+    capture program `plugin_prog', plugin using("`plugin_path'")
+    local load_rc = _rc
+    // r(110) means still loaded; after discard a new binding succeeds even
+    // though the old path macro survives. Never call a plugin at another path.
+    if (`load_rc' == 110 & "$XSAMPLEFE_PLUGIN_PATH_INTERNAL" != "`plugin_path'") {
         di as err "xsamplefe: the active session is still bound to an older xsamplefe.plugin path"
         di as err "xsamplefe: run discard (with no arguments) and rerun the command"
+        quietly set rngstate `rngstate'
         exit 498
     }
-    capture program `plugin_prog', plugin using("`plugin_path'")
-    if (_rc & _rc != 110) {
+    if (`load_rc' & `load_rc' != 110) {
         di as err "xsamplefe.plugin could not be loaded from `plugin_path'"
-        exit _rc
+        quietly set rngstate `rngstate'
+        exit `load_rc'
     }
     global XSAMPLEFE_PLUGIN_PATH_INTERNAL "`plugin_path'"
 
@@ -445,6 +497,7 @@ program define xsamplefe, rclass byable(onecall)
         foreach s of local scalars {
             capture scalar drop `sp'`s'
         }
+        quietly set rngstate `rngstate'
         exit `rc'
     }
     foreach s of local scalars {

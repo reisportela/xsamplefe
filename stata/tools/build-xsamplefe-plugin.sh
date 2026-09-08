@@ -1,223 +1,241 @@
 #!/usr/bin/env bash
-# Build the self-contained Stata plugin `xsamplefe.plugin` (panel / fixed-effect
-# aware sampling). The plugin has no third-party dependencies: it needs only
-# stplugin.{h,c} (bundled in _deps) and a C++17 compiler with OpenMP. On
-# Windows the GNU runtimes (libgcc, libstdc++, libgomp, winpthread) are linked
-# statically so that no DLL has to ship next to the plugin.
+# Build from the bundled SDK. No downloads, installers, or system changes.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 STATA_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-
-BUILD_DIR="${SCRIPT_DIR}/_build"
 DEPS_DIR="${SCRIPT_DIR}/_deps"
-STPLUGIN_H="${DEPS_DIR}/stplugin.h"
-STPLUGIN_C="${DEPS_DIR}/stplugin.c"
-mkdir -p "${BUILD_DIR}" "${DEPS_DIR}"
-
-download() {
-  local url="$1"
-  local out="$2"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$out"
-    return
-  fi
-  if command -v wget >/dev/null 2>&1; then
-    wget -qO "$out" "$url"
-    return
-  fi
-  echo "Error: neither curl nor wget is available to download $url" >&2
-  exit 1
-}
-
-if [[ ! -f "${STPLUGIN_H}" ]]; then
-  echo "Downloading stplugin.h..."
-  download "https://www.stata.com/plugins/stplugin.h" "${STPLUGIN_H}"
-fi
-if [[ ! -f "${STPLUGIN_C}" ]]; then
-  echo "Downloading stplugin.c..."
-  download "https://www.stata.com/plugins/stplugin.c" "${STPLUGIN_C}"
-fi
-
-OUT_PLUGIN="${STATA_DIR}/xsamplefe.plugin"
 
 usage() {
   cat <<'EOF'
-Usage: build-xsamplefe-plugin.sh [--windows|--linux] [--openmp|--no-openmp] [--march-native]
+Usage: build-xsamplefe-plugin.sh [target] [options]
 
-Builds the Stata plugin `xsamplefe.plugin` next to xsamplefe.ado.
+Targets (default: this host):
+  --linux            Linux x86-64, GCC with OpenMP
+  --windows          Windows x86-64, MSYS2 UCRT64/MINGW64 or a MinGW-w64 cross compiler
+  --macos-arm64      macOS Apple Silicon, Apple Clang and ARM64 libomp
+  --macos-intel      macOS Intel, Apple Clang and x86-64 libomp
+  --macos            macOS, architecture of the current shell
 
-Targets:
-  --windows    Build a Windows (PE/DLL) plugin using mingw-w64 (static GNU runtimes):
-               cross build from Linux/WSL (apt-get install g++-mingw-w64-x86-64) or
-               native build in an MSYS2 MINGW64 shell (pacman -S mingw-w64-x86_64-gcc).
-  --linux      Build a Linux/macOS (ELF/Mach-O) plugin using the native toolchain
-               (default when no target is given; macOS gives a universal binary).
-
-OpenMP:
-  --openmp     Enable OpenMP (default on Linux and Windows; production builds must
-               use it). On macOS it needs Homebrew libomp (brew install libomp) and
-               builds for the host architecture only.
-  --no-openmp  Disable OpenMP (default on macOS; diagnostic builds elsewhere).
+Options:
+  --arch ARCH        x86_64 or arm64; arm64 is supported only for macOS
+  --output FILE      output .plugin path; default: stata/xsamplefe_<platform>.plugin
+  --openmp           OpenMP on (default for every target; production builds)
+  --no-openmp        serial diagnostic build
+  --march-native     Linux-only CPU tuning; do not redistribute that binary
+  --no-march-native  disable CPU tuning (default)
+  --dry-run          print the build plan without invoking the compiler or writing files
+  --help             show this help without writing files
 
 Environment:
-  XHDFE_STATIC_GNU_LIBS=1   Linux: embed libstdc++/libgcc (portable binary; libgomp
-                            and glibc stay dynamic).
-  LIBOMP_PREFIX=/path       macOS: libomp prefix when brew is not on PATH.
+  CXX                compiler executable (not a shell command with arguments)
+  LIBOMP_PREFIX      macOS libomp prefix; otherwise read from brew --prefix libomp
+  LIBOMP_PREFIX_ARM64 / LIBOMP_PREFIX_X86_64
+                     architecture-specific overrides, including cross-architecture Mac builds
+  XSAMPLEFE_STATIC_GNU_LIBS=1
+                     Linux: static libstdc++/libgcc; libgomp/glibc remain dynamic
+  XSAMPLEFE_TARGET / XSAMPLEFE_OPENMP / XSAMPLEFE_ENABLE_MARCH_NATIVE
+                     defaults overridden by explicit options
 
-CPU tuning:
-  --march-native   Tune for the build host (opt-in; not for redistribution).
+Legacy XHDFE_* defaults remain accepted. Windows GNU runtimes are linked statically.
+Mac builds require macOS and the Xcode command line tools; Linux cannot substitute
+for a Mac SDK. A Mac libomp library must contain the requested architecture.
+Existing output files are backed up in the printed build directory before replacement.
+After net install, run discard in Stata before using a newly built plugin.
 EOF
 }
 
-TARGET="${XHDFE_TARGET:-}"
-OPENMP_MODE="${XHDFE_OPENMP:-}"
-MARCH_NATIVE_MODE="${XHDFE_ENABLE_MARCH_NATIVE:-}"
+fail() { echo "Error: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || fail "required tool not found: $1"; }
+print_command() { printf '  '; printf '%q ' "$@"; printf '\n'; }
 
+TARGET="${XSAMPLEFE_TARGET:-${XHDFE_TARGET:-}}"
+OPENMP_MODE="${XSAMPLEFE_OPENMP:-${XHDFE_OPENMP:-on}}"
+MARCH_NATIVE_MODE="${XSAMPLEFE_ENABLE_MARCH_NATIVE:-${XHDFE_ENABLE_MARCH_NATIVE:-off}}"
+ARCH=""
+OUT_PLUGIN=""
+DRY_RUN=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --windows|--win|--win64) TARGET="windows"; shift ;;
-    --linux) TARGET="linux"; shift ;;
-    --openmp) OPENMP_MODE="on"; shift ;;
-    --no-openmp) OPENMP_MODE="off"; shift ;;
-    --march-native|--native) MARCH_NATIVE_MODE="on"; shift ;;
-    --no-march-native) MARCH_NATIVE_MODE="off"; shift ;;
+    --linux) TARGET=linux; shift ;;
+    --windows|--win|--win64) TARGET=windows; shift ;;
+    --macos) TARGET=macos; shift ;;
+    --macos-arm64) TARGET=macos; ARCH=arm64; shift ;;
+    --macos-intel) TARGET=macos; ARCH=x86_64; shift ;;
+    --arch|--output)
+      [[ $# -ge 2 && -n "$2" ]] || fail "$1 requires a value"
+      if [[ "$1" == --arch ]]; then ARCH="$2"; else OUT_PLUGIN="$2"; fi
+      shift 2 ;;
+    --openmp) OPENMP_MODE=on; shift ;;
+    --no-openmp) OPENMP_MODE=off; shift ;;
+    --march-native|--native) MARCH_NATIVE_MODE=on; shift ;;
+    --no-march-native) MARCH_NATIVE_MODE=off; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    *) fail "unknown argument: $1 (use --help)" ;;
   esac
 done
 
 UNAME_S="$(uname -s)"
-if [[ -z "${TARGET}" ]]; then
-  case "${UNAME_S}" in
-    Darwin) TARGET="linux" ;;
-    Linux) if [[ -n "${WSL_DISTRO_NAME:-}" ]]; then TARGET="windows"; else TARGET="linux"; fi ;;
-    MINGW*|MSYS*|CYGWIN*) TARGET="windows" ;;
-    *) TARGET="linux" ;;
+UNAME_M="$(uname -m)"
+if [[ -z "$TARGET" ]]; then
+  case "$UNAME_S" in
+    Linux) TARGET=linux ;; # WSL is Linux unless --windows is explicitly requested.
+    Darwin) TARGET=macos ;;
+    MINGW*|MSYS*|CYGWIN*) TARGET=windows ;;
+    *) fail "unsupported host: $UNAME_S" ;;
+  esac
+fi
+case "$TARGET" in linux|windows|macos) ;; *) fail "invalid target: $TARGET" ;; esac
+case "$OPENMP_MODE" in on|1|ON|true|yes) OPENMP_MODE=on ;; off|0|OFF|false|no) OPENMP_MODE=off ;; *) fail "invalid OpenMP mode: $OPENMP_MODE" ;; esac
+case "$MARCH_NATIVE_MODE" in on|1|ON|true|yes) MARCH_NATIVE_MODE=on ;; off|0|OFF|false|no) MARCH_NATIVE_MODE=off ;; *) fail "invalid CPU tuning mode: $MARCH_NATIVE_MODE" ;; esac
+if [[ -z "$ARCH" ]]; then
+  if [[ "$TARGET" == macos ]]; then ARCH="$UNAME_M"; else ARCH=x86_64; fi
+fi
+case "$ARCH" in x86_64|amd64) ARCH=x86_64 ;; arm64|aarch64) ARCH=arm64 ;; *) fail "unsupported architecture: $ARCH" ;; esac
+[[ "$TARGET" == macos || "$ARCH" == x86_64 ]] || fail "$TARGET Stata builds require x86_64"
+[[ "$MARCH_NATIVE_MODE" == off || "$TARGET" == linux ]] || fail "--march-native is supported only on Linux"
+if [[ "$DRY_RUN" == 0 ]]; then
+  case "$TARGET:$UNAME_S" in
+    linux:Linux|windows:Linux|windows:MINGW*|windows:MSYS*|windows:CYGWIN*|macos:Darwin) ;;
+    *) fail "cannot build $TARGET on $UNAME_S with this script; use a native toolchain for that target" ;;
   esac
 fi
 
-SYSTEM_DEF="OPUNIX"
-if [[ "${UNAME_S}" == "Darwin" ]]; then
-  SYSTEM_DEF="APPLEMAC"
-fi
+SYSTEM_DEF=OPUNIX
+LINK_MODE=-shared
+case "$TARGET" in
+  linux) PLATFORM=linux64; CXX="${CXX:-g++}" ;;
+  windows)
+    PLATFORM=win64; SYSTEM_DEF=STWIN32
+    if [[ -z "${CXX:-}" ]]; then
+      case "$UNAME_S" in MINGW*|MSYS*) CXX=g++ ;; *) CXX=x86_64-w64-mingw32-g++ ;; esac
+    fi ;;
+  macos)
+    SYSTEM_DEF=APPLEMAC; LINK_MODE=-bundle; CXX="${CXX:-clang++}"
+    if [[ "$ARCH" == arm64 ]]; then PLATFORM=macarm64; else PLATFORM=macintel64; fi ;;
+esac
+if [[ -z "$OUT_PLUGIN" ]]; then OUT_PLUGIN="${STATA_DIR}/xsamplefe_${PLATFORM}.plugin"; fi
+[[ "$OUT_PLUGIN" == /* ]] || OUT_PLUGIN="${PWD}/${OUT_PLUGIN}"
+[[ "$OUT_PLUGIN" == *.plugin ]] || fail "--output must name a .plugin file"
 
-if [[ "${TARGET}" == "windows" ]]; then
-  # Cross build (Linux/WSL) uses the mingw-w64 triplet; a native MSYS2 MINGW64
-  # shell has plain g++ (and usually the triplet too).
-  if [[ -z "${CXX:-}" ]]; then
-    if command -v x86_64-w64-mingw32-g++ >/dev/null 2>&1; then CXX="x86_64-w64-mingw32-g++"
-    elif [[ "${UNAME_S}" == MINGW* || "${UNAME_S}" == MSYS* ]]; then CXX="g++"
-    else CXX="x86_64-w64-mingw32-g++"; fi
-  fi
-  if [[ -z "${STRIP_BIN:-}" ]]; then
-    if command -v x86_64-w64-mingw32-strip >/dev/null 2>&1; then STRIP_BIN="x86_64-w64-mingw32-strip"; else STRIP_BIN="strip"; fi
-  fi
-  SYSTEM_DEF="STWIN32"
-  if [[ -z "${OPENMP_MODE}" ]]; then OPENMP_MODE="on"; fi
-else
-  if [[ "${UNAME_S}" == "Darwin" ]]; then CXX="${CXX:-clang++}"; else CXX="${CXX:-g++}"; fi
-  STRIP_BIN="${STRIP_BIN:-strip}"
-  if [[ -z "${OPENMP_MODE}" ]]; then
-    if [[ "${UNAME_S}" == "Darwin" ]]; then OPENMP_MODE="off"; else OPENMP_MODE="on"; fi
-  fi
-fi
-
-if ! command -v "${CXX}" >/dev/null 2>&1; then
-  echo "Error: compiler not found: ${CXX}" >&2
-  if [[ "${TARGET}" == "windows" ]]; then
-    echo "Install mingw-w64 (Ubuntu/Debian): apt-get install -y g++-mingw-w64-x86-64" >&2
-    echo "On Windows: MSYS2 MINGW64 shell with pacman -S mingw-w64-x86_64-gcc" >&2
-  elif [[ "${UNAME_S}" == "Darwin" ]]; then
-    echo "Install the Xcode command line tools: xcode-select --install" >&2
-  fi
-  exit 1
-fi
-
-# macOS: Apple clang has no OpenMP runtime; --openmp uses Homebrew's libomp
-# (brew install libomp) and then builds for the host architecture only, since
-# the universal (x86_64 + arm64) binary cannot link a single-arch libomp.
+compile_flags=( -std=c++17 -O3 -DNDEBUG "-DSYSTEM=${SYSTEM_DEF}" -I"${DEPS_DIR}" )
+link_flags=( "$LINK_MODE" )
+case "$TARGET" in
+  linux) compile_flags+=( -m64 -fPIC -pthread ); link_flags+=( -pthread ) ;;
+  windows)
+    compile_flags[0]=-std=gnu++17
+    compile_flags+=( -m64 -include "${SCRIPT_DIR}/mingw_stdio_shim.h" )
+    link_flags+=( -static -static-libgcc -static-libstdc++ -Wl,--no-insert-timestamp ) ;;
+  macos) compile_flags+=( -arch "$ARCH" -fPIC -pthread ); link_flags+=( -pthread ) ;;
+esac
+if [[ "$MARCH_NATIVE_MODE" == on ]]; then compile_flags+=( -march=native -mtune=native ); fi
 OMP_PREFIX=""
-if [[ "${UNAME_S}" == "Darwin" && "${TARGET}" != "windows" && "${OPENMP_MODE}" == "on" ]]; then
-  OMP_PREFIX="${LIBOMP_PREFIX:-$(brew --prefix libomp 2>/dev/null || true)}"
-  if [[ -z "${OMP_PREFIX}" || ! -f "${OMP_PREFIX}/include/omp.h" ]]; then
-    echo "Error: --openmp on macOS needs Homebrew libomp (brew install libomp), or set LIBOMP_PREFIX." >&2
-    exit 1
-  fi
-fi
-
-if [[ -z "${MARCH_NATIVE_MODE}" ]]; then MARCH_NATIVE_MODE="off"; fi
-
-link_flag="-shared"
-if [[ "${UNAME_S}" == "Darwin" && "${TARGET}" != "windows" ]]; then
-  link_flag="-bundle"
-fi
-
-if [[ "${TARGET}" == "windows" ]]; then CXX_STD="gnu++17"; else CXX_STD="c++17"; fi
-compile_flags=( "-std=${CXX_STD}" -O3 -DNDEBUG "-DSYSTEM=${SYSTEM_DEF}" -I"${DEPS_DIR}" )
-link_flags=( "${link_flag}" )
-if [[ "${TARGET}" != "windows" ]]; then
-  compile_flags+=( -fPIC -pthread )
-  link_flags+=( -pthread )
-else
-  compile_flags+=( -include "${SCRIPT_DIR}/mingw_stdio_shim.h" )
-  # No DLL dependencies: embed the GNU runtimes (libgcc, libstdc++, libgomp,
-  # winpthread) into the plugin itself.
-  link_flags+=( -static -static-libgcc -static-libstdc++ )
-fi
-if [[ "${MARCH_NATIVE_MODE}" == "on" && "${TARGET}" != "windows" && "${UNAME_S}" != "Darwin" ]]; then
-  compile_flags+=( -march=native -mtune=native )
-fi
-if [[ "${OPENMP_MODE}" == "on" ]]; then
-  if [[ -n "${OMP_PREFIX}" ]]; then
+if [[ "$OPENMP_MODE" == on ]]; then
+  if [[ "$TARGET" == macos ]]; then
+    if [[ "$ARCH" == arm64 ]]; then OMP_PREFIX="${LIBOMP_PREFIX_ARM64:-${LIBOMP_PREFIX:-}}"
+    else OMP_PREFIX="${LIBOMP_PREFIX_X86_64:-${LIBOMP_PREFIX:-}}"; fi
+    if [[ -z "$OMP_PREFIX" && "$DRY_RUN" == 0 ]] && command -v brew >/dev/null 2>&1; then
+      OMP_PREFIX="$(brew --prefix libomp 2>/dev/null || true)"
+    fi
+    if [[ -z "$OMP_PREFIX" ]]; then
+      if [[ "$DRY_RUN" == 1 ]]; then OMP_PREFIX="<libomp-prefix-for-${ARCH}>"
+      else fail "install libomp for $ARCH and set LIBOMP_PREFIX (or use Homebrew)"; fi
+    fi
     compile_flags+=( -Xpreprocessor -fopenmp -I"${OMP_PREFIX}/include" )
-    link_flags+=( -L"${OMP_PREFIX}/lib" -lomp )
+    link_flags+=( "${OMP_PREFIX}/lib/libomp.dylib" -Xlinker -rpath -Xlinker "${OMP_PREFIX}/lib" )
   else
-    compile_flags+=( -fopenmp )
-    link_flags+=( -fopenmp )
+    compile_flags+=( -fopenmp ); link_flags+=( -fopenmp )
   fi
 fi
-if [[ "${TARGET}" != "windows" && "${UNAME_S}" == "Linux" && "${XHDFE_STATIC_GNU_LIBS:-}" =~ ^(1|ON|on|true|yes)$ ]]; then
+if [[ "$TARGET" == linux && "${XSAMPLEFE_STATIC_GNU_LIBS:-${XHDFE_STATIC_GNU_LIBS:-0}}" =~ ^(1|ON|on|true|yes)$ ]]; then
   link_flags+=( -static-libstdc++ -static-libgcc )
 fi
 
 SRC="${STATA_DIR}/src/xsamplefe_plugin.cpp"
+STPLUGIN_C="${DEPS_DIR}/stplugin.c"
+echo "Target: ${PLATFORM}; architecture: ${ARCH}; OpenMP: ${OPENMP_MODE}"
+echo "Output: ${OUT_PLUGIN}"
+if [[ "$DRY_RUN" == 1 ]]; then
+  print_command "$CXX" "${compile_flags[@]}" -x c++ "$STPLUGIN_C" -x none "$SRC" "${link_flags[@]}" -o "$OUT_PLUGIN"
+  echo "Plan only: compiler, SDK, runtime architecture and resulting binary have not been validated."
+  exit 0
+fi
 
-compile_plugin() {
-  local out="$1"
-  shift
-  "${CXX}" "${compile_flags[@]}" "$@" "${link_flags[@]}" \
-    -x c++ "${STPLUGIN_C}" -x none "${SRC}" -o "${out}"
-}
-
-if [[ "${UNAME_S}" == "Darwin" && "${TARGET}" != "windows" && -n "${OMP_PREFIX}" ]]; then
-  echo "Building ${OUT_PLUGIN} (macOS $(uname -m), OpenMP via ${OMP_PREFIX})"
-  compile_plugin "${OUT_PLUGIN}"
-elif [[ "${UNAME_S}" == "Darwin" && "${TARGET}" != "windows" ]]; then
-  echo "Building ${OUT_PLUGIN} (universal: x86_64 + arm64, OpenMP off)"
-  tmp_x86="${BUILD_DIR}/xsamplefe.plugin.x86_64"
-  tmp_arm="${BUILD_DIR}/xsamplefe.plugin.arm64"
-  compile_plugin "${tmp_x86}" -target x86_64-apple-macos10.12
-  compile_plugin "${tmp_arm}" -target arm64-apple-macos11
-  lipo -create -output "${OUT_PLUGIN}" "${tmp_x86}" "${tmp_arm}"
+need "$CXX"
+[[ -f "$SRC" && -f "$STPLUGIN_C" && -f "${DEPS_DIR}/stplugin.h" ]] || fail "incomplete source archive: bundled C++ source and stplugin.{h,c} are required"
+if [[ "$TARGET" == windows ]]; then
+  [[ -f "${SCRIPT_DIR}/mingw_stdio_shim.h" ]] || fail "bundled Windows stdio shim is missing"
+  case "$("$CXX" -dumpmachine)" in x86_64*mingw*) ;; *) fail "Windows requires an x86_64 MinGW-w64 compiler (MSYS2 UCRT64/MINGW64 or cross compiler)" ;; esac
+  if [[ -z "${OBJDUMP:-}" ]]; then
+    if command -v x86_64-w64-mingw32-objdump >/dev/null 2>&1; then OBJDUMP=x86_64-w64-mingw32-objdump
+    else OBJDUMP=objdump; fi
+  fi
+  need "$OBJDUMP"
+elif [[ "$TARGET" == macos ]]; then
+  need lipo; need otool
+  if [[ "$OPENMP_MODE" == on ]]; then
+    [[ -f "${OMP_PREFIX}/include/omp.h" && -f "${OMP_PREFIX}/lib/libomp.dylib" ]] || fail "libomp headers/library missing under $OMP_PREFIX"
+    lipo -verify_arch "$ARCH" "${OMP_PREFIX}/lib/libomp.dylib" || fail "libomp does not contain $ARCH; select the matching LIBOMP_PREFIX"
+  fi
 else
-  echo "Building ${OUT_PLUGIN} (target=${TARGET}, openmp=${OPENMP_MODE})"
-  compile_plugin "${OUT_PLUGIN}"
+  need readelf
 fi
-
-if command -v "${STRIP_BIN}" >/dev/null 2>&1; then
-  if [[ "${UNAME_S}" == "Darwin" && "${TARGET}" != "windows" ]]; then
-    "${STRIP_BIN}" -x "${OUT_PLUGIN}" || true
-  else
-    "${STRIP_BIN}" "${OUT_PLUGIN}" || true
-  fi
+if [[ "$OPENMP_MODE" == on ]]; then
+  definitions="$("$CXX" "${compile_flags[@]}" -dM -E -x c++ - < /dev/null)"
+  [[ "$definitions" == *'#define _OPENMP '* ]] || fail "compiler did not enable OpenMP; refusing a serial production build"
 fi
+[[ ! -L "$OUT_PLUGIN" && ! -L "${OUT_PLUGIN}.build.txt" ]] || fail "refusing a symlink output"
+[[ ! -e "$OUT_PLUGIN" || -f "$OUT_PLUGIN" ]] || fail "output is not a regular file"
+[[ ! -e "${OUT_PLUGIN}.build.txt" || -f "${OUT_PLUGIN}.build.txt" ]] || fail "build receipt is not a regular file"
+OUT_DIR="$(dirname -- "$OUT_PLUGIN")"
+mkdir -p "$OUT_DIR"
+WORK_DIR="$(mktemp -d "${OUT_DIR}/.tmp-xsamplefe-${PLATFORM}.XXXXXX")"
+echo "Build directory: ${WORK_DIR}"
+"$CXX" "${compile_flags[@]}" -x c++ "$STPLUGIN_C" -x none "$SRC" "${link_flags[@]}" -o "${WORK_DIR}/xsamplefe.plugin"
 
-if [[ "${TARGET}" != "windows" && "${UNAME_S}" == "Linux" ]]; then
-  if [[ "${OPENMP_MODE}" == "on" ]] && ! ldd "${OUT_PLUGIN}" | grep -q 'libgomp'; then
-    echo "Error: --openmp was requested but ${OUT_PLUGIN} does not link libgomp." >&2
-    exit 1
-  fi
+case "$TARGET" in
+  linux)
+    header="$(LC_ALL=C readelf -h "${WORK_DIR}/xsamplefe.plugin")"
+    [[ "$header" == *ELF64* && "$header" == *'Advanced Micro Devices X86-64'* ]] || fail "output is not Linux x86-64 ELF"
+    if [[ "$OPENMP_MODE" == on ]]; then
+      dynamic="$(LC_ALL=C readelf -d "${WORK_DIR}/xsamplefe.plugin")"
+      [[ "$dynamic" == *libgomp* || "$dynamic" == *libomp* ]] || fail "output has no OpenMP runtime dependency"
+    fi ;;
+  windows)
+    header="$(LC_ALL=C "$OBJDUMP" -f "${WORK_DIR}/xsamplefe.plugin")"
+    [[ "$header" == *pei-x86-64* ]] || fail "output is not a Windows x86-64 PE library"
+    imports="$(LC_ALL=C "$OBJDUMP" -p "${WORK_DIR}/xsamplefe.plugin")"
+    if printf '%s\n' "$imports" | grep -Ei 'DLL Name:.*(libgcc|libstdc\+\+|libgomp|libwinpthread|libquadmath|libssp|msys-2|cygwin1)' >/dev/null; then
+      fail "Windows output depends on a non-static GNU/MSYS runtime"
+    fi ;;
+  macos)
+    lipo -verify_arch "$ARCH" "${WORK_DIR}/xsamplefe.plugin"
+    if [[ "$OPENMP_MODE" == on ]]; then
+      dynamic="$(otool -L "${WORK_DIR}/xsamplefe.plugin")"
+      [[ "$dynamic" == *libomp.dylib* ]] || fail "output has no libomp dependency"
+    fi ;;
+esac
+
+# Keep exported plugin entry points; omit local/debug symbols from distribution.
+if [[ -z "${STRIP_BIN:-}" ]]; then
+  if [[ "$TARGET" == windows ]] && command -v x86_64-w64-mingw32-strip >/dev/null 2>&1; then
+    STRIP_BIN=x86_64-w64-mingw32-strip
+  else STRIP_BIN=strip; fi
 fi
+need "$STRIP_BIN"
+if [[ "$TARGET" == macos ]]; then "$STRIP_BIN" -x "${WORK_DIR}/xsamplefe.plugin"
+else "$STRIP_BIN" "${WORK_DIR}/xsamplefe.plugin"; fi
 
+# Only validated build outputs replace a previous binary. Backups are retained.
+if [[ -f "$OUT_PLUGIN" ]]; then cp -p "$OUT_PLUGIN" "${WORK_DIR}/previous.plugin"; fi
+if [[ -f "${OUT_PLUGIN}.build.txt" ]]; then cp -p "${OUT_PLUGIN}.build.txt" "${WORK_DIR}/previous.build.txt"; fi
+{
+  printf 'platform=%s\narchitecture=%s\nopenmp=%s\nmarch_native=%s\n' "$PLATFORM" "$ARCH" "$OPENMP_MODE" "$MARCH_NATIVE_MODE"
+  printf 'compiler='; "$CXX" --version | sed -n '1p'
+  printf 'built_utc='; date -u '+%Y-%m-%dT%H:%M:%SZ'
+} > "${WORK_DIR}/build.txt"
+mv "${WORK_DIR}/xsamplefe.plugin" "$OUT_PLUGIN"
+mv "${WORK_DIR}/build.txt" "${OUT_PLUGIN}.build.txt"
 echo "Done: ${OUT_PLUGIN}"
+echo "Install using the package descriptor (net install), or explicitly build --output stata/xsamplefe.plugin for adopath use."

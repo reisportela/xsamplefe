@@ -9,6 +9,7 @@ prompts/
 
 # Compiled plugin binaries (platform-specific build outputs)
 *.plugin
+*.plugin.build.txt
 *.o
 *.so
 *.dll
@@ -34,3 +35,30 @@ Thumbs.db
 *.swp
 _tmp*/
 .tmp*/
+
+# Local editor buffers, exploratory tests and machine-specific benchmarks
+*.stswp
+/tests/mini_example.do
+/tests/smoke_session_*.do
+/tests/local/
+/tests/*_local.*
+/benchmarks/
+
+# Dated working reports and private distribution preparation
+/docs/*CODEX*.md
+/docs/*READINESS*.md
+/docs/VALIDATION_20*.md
+/docs/RESEARCHER*.md
+/stata/tools/build-researcher-candidate.py
+/tests/test_researcher_distribution.py
+
+# Generated distributions and Python caches
+/dist/
+/release_out/
+/build/
+*.zip
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.env.*

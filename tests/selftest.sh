@@ -14,8 +14,9 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-OUT_DIR="${SCRIPT_DIR}/output"
-LOG_FILE="${OUT_DIR}/testall.log"
+mkdir -p "${SCRIPT_DIR}/output"
+OUT_DIR="$(mktemp -d "${SCRIPT_DIR}/output/selftest_XXXXXXXX")"
+LOG_FILE="${OUT_DIR}/injected/testall.log"
 MARKER="XSAMPLEFE CERTIFICATION TESTS COMPLETED SUCCESSFULLY"
 mkdir -p "${OUT_DIR}"
 
@@ -24,20 +25,19 @@ note() { echo "  $*"; }
 bad() { echo "  FAIL: $*" >&2; fail=1; }
 
 echo "== 1/2 injected failure: run_tests.sh must report it"
-XSAMPLEFE_SELFTEST=1 bash "${SCRIPT_DIR}/run_tests.sh" >"${OUT_DIR}/selftest_injected.out" 2>&1
+XSAMPLEFE_TEST_OUTDIR="${OUT_DIR}/injected" XSAMPLEFE_SELFTEST=1 bash "${SCRIPT_DIR}/run_tests.sh" >"${OUT_DIR}/selftest_injected.out" 2>&1
 rc=$?
-cp -f "${LOG_FILE}" "${OUT_DIR}/selftest_injected.log" 2>/dev/null || true
 note "exit status ${rc}"
 if [[ ${rc} -eq 0 ]]; then bad "run_tests.sh exited 0 with a failing certification file"; fi
-if [[ ! -f "${OUT_DIR}/selftest_injected.log" ]]; then
+if [[ ! -f "${LOG_FILE}" ]]; then
   bad "no testall.log was produced"
 else
-  if grep -q "${MARKER}" "${OUT_DIR}/selftest_injected.log"; then
+  if grep -Fxq "${MARKER}" "${LOG_FILE}"; then
     bad "the success marker is in the log of a failing run"
   else
     note "success marker absent, as required"
   fi
-  if grep -q "assertion is false" "${OUT_DIR}/selftest_injected.log"; then
+  if grep -q "assertion is false" "${LOG_FILE}"; then
     note "the failed assert is visible in the log"
   else
     bad "the log does not contain \"assertion is false\""
@@ -45,15 +45,22 @@ else
 fi
 
 echo "== 2/2 normal run: run_tests.sh must pass"
-bash "${SCRIPT_DIR}/run_tests.sh" >"${OUT_DIR}/selftest_normal.out" 2>&1
+XSAMPLEFE_TEST_OUTDIR="${OUT_DIR}/normal" XSAMPLEFE_SELFTEST=0 bash "${SCRIPT_DIR}/run_tests.sh" >"${OUT_DIR}/selftest_normal.out" 2>&1
 rc=$?
+LOG_FILE="${OUT_DIR}/normal/testall.log"
 note "exit status ${rc}"
 if [[ ${rc} -ne 0 ]]; then bad "run_tests.sh failed on the normal path (see ${OUT_DIR}/selftest_normal.out)"; fi
-if grep -q "${MARKER}" "${LOG_FILE}"; then
+if grep -Fxq "${MARKER}" "${LOG_FILE}"; then
   note "success marker present, as required"
 else
   bad "the success marker is missing from the normal run"
 fi
+
+echo "== missing Stata execution: an old successful log must not make this pass"
+STATA_BIN=true XSAMPLEFE_TEST_OUTDIR="${OUT_DIR}/normal" bash "${SCRIPT_DIR}/run_tests.sh" >"${OUT_DIR}/selftest_stale.out" 2>&1
+if [[ $? -eq 0 ]]; then bad "run_tests.sh accepted a stale successful log"; fi
+STATA_BIN=true XSAMPLEFE_TEST_OUTDIR="${OUT_DIR}/no_stata" bash "${SCRIPT_DIR}/run_tests.sh" >"${OUT_DIR}/selftest_no_stata.out" 2>&1
+if [[ $? -eq 0 ]]; then bad "run_tests.sh passed without running Stata"; fi
 
 if [[ ${fail} -ne 0 ]]; then
   echo "xsamplefe harness self-test FAILED" >&2

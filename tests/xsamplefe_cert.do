@@ -1,4 +1,5 @@
 noi di as text "xsamplefe certification (panel / fixed-effect aware sampling)"
+set varabbrev off
 
 capture which xsamplefe
 if (c(rc)) {
@@ -438,10 +439,15 @@ gen double z = -_n
 set seed 3
 xsamplefe 100, unit(worker_id) absorb(worker_id firm_id) minmobility(2) generate(a)
 local mob_full "`r(mobility)'"
+* Explicit abbreviations obey Stata's varabbrev setting.
+capture xsamplefe 100, unit(worker_id) absorb(work firm_id) minmobility(2) generate(b)
+assert _rc == 111
+set varabbrev on
 set seed 3
 xsamplefe 100, unit(worker_id) absorb(work firm_id) minmobility(2) generate(b)
 assert "`r(mobility)'" == "`mob_full'" & "`mob_full'" == "firm_id"
 assert a == b & a == 1
+set varabbrev off
 * reghdfe slope syntax with a parenthesised continuous list
 set seed 4
 xsamplefe 50, absorb(worker_id##c.(x z) firm_id) generate(c1)

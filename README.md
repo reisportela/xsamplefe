@@ -4,11 +4,13 @@
 [`reghdfe`](https://github.com/sergiocorreia/reghdfe) and
 [`xhdfe`](https://github.com/reisportela/xhdfe-xfe) in Stata. It is a superset
 of Stata's `sample` and of Weesie's `sample2` (STB-37 dm46): instead of drawing
-observations it can draw whole *units* (workers, firms, patents, ...) so that
-the fixed-effect structure of the sample stays estimable, and it adds strata,
+observations it can draw whole *units* (workers, firms, patents, ...), preserving
+their histories unless a different `group()` overrides unit retention. It adds strata,
 balanced-panel and mobility filters, connected sets and `reghdfe`'s
 `group()`/`individual()` designs. The work is done by a C++17/OpenMP plugin with
-no external dependencies.
+no dependencies beyond compiler runtimes. Sampling does not guarantee that a
+regression is estimable, connected, or unbiased; those properties also depend
+on the model, missing data, identifying variation, and the sampling design.
 
 ```stata
 . xsamplefe 10, absorb(worker firm year)                      // 10% of the workers, all their spells
@@ -22,6 +24,104 @@ no external dependencies.
 . xsamplefe 10, absorb(worker firm) reconnect                 // grow the largest component back (costs size)
 . xsamplefe 10, absorb(worker firm) minmovers(2)              // drop firms with fewer than 2 movers (cascades)
 ```
+
+## Install the latest release
+
+In Stata 14 or newer, run:
+
+```stata
+net install xsamplefe, from("https://github.com/reisportela/xsamplefe/releases/latest/download") replace
+discard
+help xsamplefe
+```
+
+This address always selects the **latest stable release**. Run the same command
+again to update. Stata selects the binary for Linux x86-64, Windows x86-64,
+macOS Apple Silicon, or macOS Intel. No compiler is needed; Mac releases include
+OpenMP, and Windows compiler runtimes are linked statically. See
+[INSTALL.md](INSTALL.md) for system requirements and local installation.
+Drawing samples does not require `reghdfe` or `xhdfe`.
+
+Get the installation check and self-contained examples into the current folder:
+
+```stata
+net get xsamplefe, from("https://github.com/reisportela/xsamplefe/releases/latest/download")
+do xsamplefe_check.do
+do xsamplefe_basics.do
+do xsamplefe_tour.do
+```
+
+The tutorials start with `clear`; save your work before running them.
+For offline installation or sharing with colleagues, download the
+[standalone ZIP for all four platforms](https://github.com/reisportela/xsamplefe/releases/latest/download/xsamplefe.zip).
+It includes the binaries, help, examples, source and build script. Platform-specific
+ZIPs and SHA-256 checksums are also on the
+[latest release page](https://github.com/reisportela/xsamplefe/releases/latest).
+
+## The command at a glance
+
+`xsamplefe` is one pipeline. Every stage decides *which units are drawn*; only
+the last one touches your data.
+
+```
++- 1  FRAME - which rows are in play
+|
+|   if/in          rows outside are kept, never drawn
+|   unit           unit(), else group(), else the first absorb()
+|   split units    any pulls them in, all pushes them out; default: error
+|
+|- 2  ELIGIBLE - which units may be drawn
+|
+|   panel          balanced minperiods() maxperiods() minobs() maxobs()
+|   mobility       minmobility() maxmobility()
+|                  ineligible units are dropped, and counted
+|
+|- 3  STRATA - how the draw is split
+|
+|   by()           strata, which must be constant within units
+|   mobstrata      one stratum per mobility class of the unit
+|   rates          movers() and stayers(): one rate for each class
+|
+|- 4  DRAW - int(n*#/100+.5) units per stratum
+|
+|   #              a percentage, or a number of units with count
+|   seed()         the r-th smallest unit value takes the r-th uniform
+|
+|- 5  AFTER THE DRAW - retention rules
+|
+|   grouprule()    keep a group if any (default) or all of its units were drawn
+|   reconnect      grow the largest component back to the frame's share
+|   minmovers()    drop values with too few movers, and their units
+|   connected      keep only the largest connected component
+|
++- 6  RESULT - what you get back
+
+      generate()     a 0/1 indicator; without it the rows are deleted
+      connectivity   components and movers per value, frame and sample
+      r()            every count above; verbose times each phase
+```
+
+Stages 1 to 4 are the sample. Stage 5 is the only place where a unit that was
+*not* drawn can come back (`grouprule(any)`, `reconnect`) or a unit that *was*
+drawn can leave (`minmovers()`, `connected`), which is why the stored results
+count the units drawn and the units retained separately.
+
+When `group()` differs from `unit()`, complete groups take priority. Units can
+be partially retained and ineligible units can return through a kept group;
+check `r(N_units_partial)` and `r(N_units_ineligible_retained)`.
+
+| what you want | what to add |
+|---|---|
+| exactly what `sample` draws | no sampling unit at all |
+| whole workers | `absorb()`, or `unit()` |
+| whole firms | `unit(firm)` |
+| whole patents with their teams | `group()` `individual()` |
+| a balanced panel | `balanced` |
+| proportional mobility classes | `mobstrata` |
+| a variance decomposition | `movers(100)` `stayers(#)` |
+| a connected sample | `connected`, `reconnect` |
+| firms with enough movers | `minmovers(#)` |
+| an indicator instead of deleting | `generate()` |
 
 ## Features
 
@@ -55,7 +155,8 @@ diagnostics, `r(rngstate)` before drawing and the dimensions used. See `help xsa
   observations that `sample # [if] [, by() count]` retains under the same seed
   and data order, and leaves the random-number generator in the same state.
 - With a unit (`unit()`, `group()`, or the first `absorb()` variable), whole
-  units are kept or dropped. The draw depends only on the seed and on the set of
+  units are kept or dropped unless a different `group()` applies group closure.
+  The random keys depend only on the seed and on the set of
   unit values, never on the physical order of the rows, and never on the number
   of threads.
 - `any`/`all` resolve units split by `if`/`in` as in `sample2`; `generate()`
@@ -70,9 +171,11 @@ diagnostics, `r(rngstate)` before drawing and the dimensions used. See `help xsa
 ## Mobility fidelity
 
 Whole-unit sampling keeps every spell of a drawn unit, so the mobility of every
-retained unit (distinct firms, transitions) is exactly the one in the population
-and the shares of movers and of the mobility classes are unbiased. It does not
-guarantee the exact composition of the sample, nor that the sample stays
+retained unit (distinct firms, transitions) is the one in its frame, provided
+group closure does not make units partial. A simple random unit sample estimates
+the eligible population's mobility shares; unequal rates and subsequent retention
+rules change the design. It does not guarantee the exact composition of the
+full dataset, nor that the sample stays
 connected. To hold the mobility classes close to the population, stratify by the
 number of distinct mobility values per unit — `mobstrata` does it natively:
 
@@ -94,8 +197,8 @@ sample to its largest connected component and reports how much was dropped.
 Observation-level sampling (`sample`) and sampling of the other dimension
 (`unit(firm)`) destroy the mobility structure; `unit(firm) group(worker)`
 restores the full histories of every worker touched by a sampled firm at the
-price of over-representing movers. `tests/xsamplefe_mobility_cert.do` and
-`docs/VALIDATION_20260908.md` quantify all of this.
+price of over-representing movers. `tests/xsamplefe_mobility_cert.do` exercises
+these cases; [validation scope](docs/VALIDATION.md) describes the test boundaries.
 
 ## Connectivity
 
@@ -123,8 +226,10 @@ most rows first (ties by the unit's own uniform key); `reconrule(key)` takes
 the frontier in that key's order, i.e. in random order.
 
 **It costs size and composition, and the cost is large.** The gain rule prefers
-the units that join the most rows, that is the hubs, and the added units are
-movers by construction. Measured on a 10% unit draw (`absorb(id1 id2)`,
+the units that join the most rows, that is the hubs. Added units may also be
+stayers: they can raise the component's row share without bridging components.
+The target may be unattainable after the frontier is exhausted.
+Measured on a 10% unit draw (`absorb(id1 id2)`,
 `set seed 1`):
 
 | dataset | 10% draw | after `reconnect` | added | mean mobility values per unit | movers |
@@ -166,13 +271,16 @@ See `help xsamplefe` for the full syntax, semantics and stored results.
 
 ## Limited mobility bias
 
-Whole-unit sampling keeps the *parameters* of the population, not the
-*precision* of a two-way fixed-effect estimator. AKM firm effects are unbiased
-one by one, but each carries noise that inflates `Var(psi_hat)` and depresses
-`Cov(alpha_hat, psi_hat)`, and the size of that bias is governed by the movers
-per firm — exactly what a sample takes away (Bonhomme, Lamadon and Manresa,
-"The ABC of AKM", *Journal of Economic Perspectives*, 2026). On their
-calibrated panel (6,000 workers, 300 firms, 5 periods), each design estimated
+Whole-unit sampling preserves selected histories, not the exact moments of the
+full population. Sampling variation, eligibility restrictions, unequal rates,
+and connectivity rules can all change the resulting variance decomposition.
+Under the AKM model's exogeneity and identification assumptions, individual
+effects can be unbiased while plug-in variances and covariances remain biased
+by estimation noise. Sparse mobility can inflate `Var(psi_hat)` and depress
+`Cov(alpha_hat, psi_hat)`; movers per firm are a useful diagnostic, not a
+sufficient condition for unbiased estimation. See Bonhomme, Manresa and Lamadon,
+[The ABC of AKM](https://arxiv.org/abs/2603.17034) (2026). In the repository's
+calibrated simulation (6,000 workers, 300 firms, 5 periods), each design estimated
 on its own connected set:
 
 | design | rows | movers/firm | Var(psi) true | Var(psi) AKM | 2Cov true | 2Cov AKM |
@@ -183,13 +291,16 @@ on its own connected set:
 | 10% of rows (`sample`) | 1,738 | 2.1 | 0.087 | 0.440 | 0.177 | −0.338 |
 | `movers(100) stayers(10)` | 19,735 | 30.3 | 0.089 | 0.093 | 0.139 | 0.133 |
 
-The true columns barely move: the draw is faithful. The AKM columns do: the
+In this simulation the true columns barely move across simple unit samples.
+The AKM columns do: the
 estimated `Var(psi)` is 5% above the truth on the full data, 20% at a quarter
 of the workers, 70% at a tenth, and five times the truth when the same number
 of *rows* is drawn instead of units, with a covariance that changes sign. So a
-unit sample is fine for coefficients on covariates, and for a variance
-decomposition you should keep every mover (`movers(100) stayers(#)`), which
-restores an unbiased decomposition of a *different* population. `minmovers(#)`
+unit sample can preserve useful identifying variation, but coefficients still
+require the model's assumptions and an appropriate variance estimator.
+Keeping every mover (`movers(100) stayers(#)`) retains more information about
+firm effects while changing inclusion probabilities and the target composition.
+The small variance bias here is not a general guarantee or a bias correction. `minmovers(#)`
 drops the mobility values with fewer than `#` movers and the units linked to
 them, iterating to a fixed point; it removes the noisiest firms but not the
 bias, and because units are indivisible the pruning cascades and can empty the
@@ -197,36 +308,62 @@ sample (`minmovers(2)` drops 46 of 300 units on that panel, `minmovers(3)`
 leaves nothing and says so). `tests/xsamplefe_estimation_cert.do` fixes these
 numbers.
 
-## Install
+## Worked examples
 
-From a local checkout (or an unzipped release):
+[xsamplefe_basics.do](stata/xsamplefe_basics.do) is a short course on row and
+worker samples, indicators, counts, strata, `if`, balance, and estimation.
+[xsamplefe_tour.do](stata/xsamplefe_tour.do) covers mobility, connectivity,
+pruning, and patents with multiple inventors. Both generate artificial data,
+need no downloads or additional packages, and can be read block by block.
+They start with `clear`, so save any unsaved work first.
 
 ```stata
-adopath ++ "/path/to/xsamplefe/stata"
+do "/path/to/xsamplefe/stata/xsamplefe_basics.do"
+do "/path/to/xsamplefe/stata/xsamplefe_tour.do"
 ```
 
-or
+After a net installation, use the `net get` command in the installation section
+above to retrieve the tutorials and `xsamplefe_check.do` into the current directory.
+
+## Build from source
+
+The release binaries are built online by GitHub Actions on Linux, Windows,
+Mac Intel and Mac ARM runners. Each runner loads its plugin and exercises the
+Stata plugin interface, including OpenMP, before packaging. Native Stata
+certification is performed separately on the Linux release binary.
+
+To build your own binary, use the matching command on a machine with the required
+compiler and SDK:
+
+```bash
+bash stata/tools/build-xsamplefe-plugin.sh --linux
+bash stata/tools/build-xsamplefe-plugin.sh --windows
+bash stata/tools/build-xsamplefe-plugin.sh --macos-arm64
+bash stata/tools/build-xsamplefe-plugin.sh --macos-intel
+```
+
+Then install from the checkout or extracted ZIP:
 
 ```stata
 net install xsamplefe, from("/path/to/xsamplefe/stata") replace
+discard
 ```
 
-The plugin binary (`stata/xsamplefe.plugin`) is not versioned; build it once:
+For session-only use, build with `--output stata/xsamplefe.plugin`, then:
 
-```bash
-bash stata/tools/build-xsamplefe-plugin.sh --linux --openmp   # Linux (GCC/Clang + libgomp)
-bash stata/tools/build-xsamplefe-plugin.sh                     # macOS: universal binary, OpenMP off
-bash stata/tools/build-xsamplefe-plugin.sh --openmp            # macOS with Homebrew libomp (host arch)
-bash stata/tools/build-xsamplefe-plugin.sh --windows           # mingw-w64: MSYS2 MINGW64 shell or cross build, static runtimes
+```stata
+adopath ++ "/path/to/xsamplefe/stata"
+discard
 ```
 
-`INSTALL.md` has the per-platform details (runtime requirements of a shipped
-Linux binary, MSYS2 and WSL for Windows, `libomp` on macOS) and how to run the
-certification on a new machine.
-
-Requirements: a C++17 compiler with OpenMP (GCC/Clang; mingw-w64 for Windows).
+Compiled binaries are release assets and are not stored in Git. Each build
+target gets a separate filename in `stata/`; `net install` selects the matching
+one and installs it as `xsamplefe.plugin`. [INSTALL.md](INSTALL.md) has the
+per-platform compiler requirements and explains certification on a new machine.
 The Stata plugin interface files (`stplugin.h`/`stplugin.c`) are bundled, so
-the build works offline.
+the build works offline once the compiler/OpenMP prerequisites are installed.
+OpenMP is the default on every target. A Mac build requires macOS and its SDK;
+the script does not provide a Mac cross-compiler on Linux.
 
 ## Tests and validation
 
@@ -247,10 +384,14 @@ once with `XSAMPLEFE_SELFTEST=1`, which injects
 `tests/xsamplefe_selftest_fail.do` (one deliberately false assert) before the
 real certification files, and requires that run to exit non-zero with a log
 that lacks the success marker and contains "assertion is false"; then it runs
-the normal path and requires exit 0 with the marker. Without the variable,
-`run_tests.sh` and `testall.do` behave exactly as before.
+the normal path and requires exit 0 with the marker.
+Each certification writes a new directory under `tests/output/`; an old log
+can never supply the success marker. `XSAMPLEFE_FIXTURE_DIR` can point to a
+directory containing the public `nlswork.dta` to run the suite without downloads.
+The suite runs with `set varabbrev off`; the explicit abbreviation test enables
+abbreviations only for that comparison.
 
-The certification has four parts. `xsamplefe_cert.do` checks bit-identity
+The certification has six parts. `xsamplefe_cert.do` checks bit-identity
 with `sample` (rows and RNG state), whole-unit integrity, thread and row-order
 invariance, balanced panels, mobility rates and bounds, `group()`/`individual()`
 closure, frame rules and expected errors. `xsamplefe_compat_cert.do` compares
@@ -273,11 +414,16 @@ are unbiased, stratifying by the number of distinct mobility values per unit
 rounding, and observation-level or other-dimension sampling visibly destroys
 mobility. It also certifies the connectivity diagnostics against a pure-Stata
 component computation and `reconnect` on a deliberately sparse graph.
-`benchmarks/` contains the sweeps over the `xhdfe` core-23 /
-core-24 benchmark datasets and `docs/VALIDATION_20260908.md` the results
-(all datasets: determinism, integrity and parity OK; `reghdfe` and `xhdfe`
-agree on the samples to 1e-9 or better — see the `max_b_diff` column of the
-CSV; 173M rows sampled in 29 s).
+`xsamplefe_adversarial_cert.do` adds parser regressions, failed-call RNG
+restoration, 140 native-sample comparisons, actual 1/8/48-thread teams, and a
+disconnected all-stayer case where reconnect cannot attain its target.
+`xsamplefe_binding_cert.do` verifies missing binaries, changed plugin locations,
+and rebinding after `discard`, in copies under the run's output directory.
+Statistical assertions in these files concern the particular simulated designs;
+they do not establish unbiased estimation for arbitrary data or models.
+Local benchmark datasets, exploratory tests and audit working notes are excluded
+from Git. See [validation scope and limitations](docs/VALIDATION.md) for the
+published test contract. This is a GitHub distribution; SSC submission is deferred.
 
 ## Author and license
 

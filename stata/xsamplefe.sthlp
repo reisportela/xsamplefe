@@ -1,5 +1,5 @@
 {smcl}
-{* *! version 1.2.0  08sep2026}{...}
+{* *! version 1.2.3  09sep2026}{...}
 {vieweralsosee "[D] sample" "help sample"}{...}
 {vieweralsosee "[R] bsample" "help bsample"}{...}
 {vieweralsosee "" "--"}{...}
@@ -7,6 +7,7 @@
 {vieweralsosee "xhdfe" "help xhdfe"}{...}
 {vieweralsosee "xhdfeconnected" "help xhdfeconnected"}{...}
 {viewerjumpto "Syntax" "xsamplefe##syntax"}{...}
+{viewerjumpto "The command at a glance" "xsamplefe##map"}{...}
 {viewerjumpto "Description" "xsamplefe##description"}{...}
 {viewerjumpto "Sampling units" "xsamplefe##units"}{...}
 {viewerjumpto "Reproducibility" "xsamplefe##reproducibility"}{...}
@@ -48,7 +49,7 @@
 {synopt :{opth abs:orb(varlist)}}fixed effects of the intended regression; the first one is the default sampling unit{p_end}
 {synopt :{opth group(varname)}}group variable of {cmd:reghdfe, group()}; rows of a group are never separated{p_end}
 {synopt :{opth ind:ividual(varname)}}individual variable of {cmd:reghdfe, individual()}; requires {opt group()}{p_end}
-{synopt :{opth unit(varname)}}explicit sampling unit (whole units are kept or dropped){p_end}
+{synopt :{opth unit(varname)}}explicit sampling unit; a different {opt group()} overrides whole-unit retention{p_end}
 
 {syntab:Panel structure}
 {synopt :{opth time(varname)}}time variable (default: the {helpb xtset} time variable when needed){p_end}
@@ -87,6 +88,82 @@
 Observations not meeting the optional {it:if}/{it:in} criteria are kept (sampled at 100 percent), as in {helpb sample}.
 
 
+{marker map}{...}
+{title:The command at a glance}
+
+{pstd}
+{cmd:xsamplefe} is one pipeline. Every stage decides {it:which units are drawn};
+only the last one touches your data. Read it downwards once and the option
+names stop being a list.
+
+   {c TLC}{c -} {bf:1  FRAME} {c -} which rows are in play {c -} {help xsamplefe##units:[more]}
+   {c |}
+   {c |}{space 3}{it:if}{cmd:/}{it:in}{space 10}rows outside are kept, never drawn
+   {c |}{space 3}unit{space 11}{opt unit()}, else {opt group()}, else the first {opt absorb()}
+   {c |}{space 3}split units{space 4}{opt any} pulls them in, {opt all} pushes them out; default: error
+   {c |}
+   {c LT}{c -} {bf:2  ELIGIBLE} {c -} which units may be drawn {c -} {help xsamplefe##units:[more]}
+   {c |}
+   {c |}{space 3}panel{space 10}{opt balanced} {opt minperiods()} {opt maxperiods()} {opt minobs()} {opt maxobs()}
+   {c |}{space 3}mobility{space 7}{opt minmobility()} {opt maxmobility()}
+   {c |}{space 18}ineligible units are dropped, and counted
+   {c |}
+   {c LT}{c -} {bf:3  STRATA} {c -} how the draw is split {c -} {help xsamplefe##units:[more]}
+   {c |}
+   {c |}{space 3}{opt by()}{space 11}strata, which must be constant within units
+   {c |}{space 3}{opt mobstrata}{space 6}one stratum per mobility class of the unit
+   {c |}{space 3}rates{space 10}{opt movers()} and {opt stayers()}: one rate for each class
+   {c |}
+   {c LT}{c -} {bf:4  DRAW} {c -} {cmd:int(n*#/100+.5)} units per stratum {c -} {help xsamplefe##reproducibility:[more]}
+   {c |}
+   {c |}{space 3}{it:#}{space 14}a percentage, or a number of units with {opt count}
+   {c |}{space 3}{opt seed()}{space 9}the {it:r}-th smallest unit value takes the {it:r}-th uniform
+   {c |}
+   {c LT}{c -} {bf:5  AFTER THE DRAW} {c -} retention rules {c -} {help xsamplefe##connectivity:[more]}
+   {c |}
+   {c |}{space 3}{opt grouprule()}{space 4}keep a group if {cmd:any} (default) or {cmd:all}
+   {c |}{space 18}of its units were drawn
+   {c |}{space 3}{opt reconnect}{space 6}grow the largest component back to the frame's share
+   {c |}{space 3}{opt minmovers()}{space 4}drop values with too few movers, and their units
+   {c |}{space 3}{opt connected}{space 6}keep only the largest connected component
+   {c |}
+   {c BLC}{c -} {bf:6  RESULT} {c -} what you get back {c -} {help xsamplefe##results:[more]}
+
+   {space 6}{opt generate()}{space 5}a 0/1 indicator; without it the rows are deleted
+   {space 6}{opt connectivity}{space 3}components and movers per value, frame and sample
+   {space 6}{cmd:r()}{space 12}every count above; {opt verbose} times each phase
+
+{pstd}
+Stages 1 to 4 are the sample. Stage 5 is the only place where a unit that was
+{it:not} drawn can come back ({opt grouprule(any)}, {opt reconnect}) or a unit
+that {it:was} drawn can leave ({opt minmovers()}, {opt connected}), which is
+why the stored results count the units drawn and the units retained
+separately.
+
+{pstd}
+With a {opt group()} different from {opt unit()}, groups take priority: units
+can become partially retained, and ineligible units can return through a kept
+group. Inspect {cmd:r(N_units_partial)} and
+{cmd:r(N_units_ineligible_retained)}; see {help xsamplefe##units:Group closure}.
+
+{pstd}
+{it:Which design do I want?}
+
+   {space 3}exactly what {helpb sample} draws{space 10}no sampling unit at all
+   {space 3}whole workers{space 22}{opt absorb()}, or {opt unit()}
+   {space 3}whole firms{space 24}{opt unit(firm)}
+   {space 3}whole patents with their teams{space 5}{opt group()} {opt individual()}
+   {space 3}a balanced panel{space 19}{opt balanced}
+   {space 3}proportional mobility classes{space 6}{opt mobstrata}
+   {space 3}a variance decomposition{space 11}{opt movers(100)} {opt stayers(#)}
+   {space 3}a connected sample{space 17}{opt connected}, {opt reconnect}
+   {space 3}firms with enough movers{space 11}{opt minmovers(#)}
+   {space 3}an indicator instead of deleting{space 3}{opt generate()}
+
+{pstd}
+The full commands are under {help xsamplefe##examples:Examples}.
+
+
 {marker description}{...}
 {title:Description}
 
@@ -96,8 +173,19 @@ memory and, by default, deletes the observations that were not drawn. It is a
 superset of Stata's {helpb sample} and of Weesie's {helpb sample2}
 (STB-37 dm46), and it is designed for panel and network data that will be
 estimated with {helpb reghdfe} or {helpb xhdfe}: instead of drawing
-observations, it draws whole {it:units} (workers, firms, patents, ...) so that
-the fixed-effect structure of the sample stays estimable.
+observations, it can draw whole {it:units} (workers, firms, patents, ...).
+This preserves their histories when no different {opt group()} overrides the
+unit decision. It does not guarantee estimability: missing regression variables,
+singletons, disconnected components and insufficient within-unit variation still
+need to be checked in the intended regression. Requires Stata 14 or newer and
+a compatible compiled plugin; neither estimator is needed to draw a sample.
+
+{pstd}
+The plugin uses 32-bit row and graph indices: datasets of 2,147,483,647 or more
+observations are refused, as are graphs whose number of units plus mobility
+values exceeds 2,147,483,647. All data must fit in Stata's memory, with additional
+memory for keys and indices. {opt minmovers()} stops with an error if pruning
+exceeds 10,000 passes; a successful call has reached the stated fixed point.
 
 {pstd}
 Without {opt absorb()}, {opt group()} or {opt unit()}, {cmd:xsamplefe} samples
@@ -108,6 +196,12 @@ same seed and data order, the {it:same drawn observations} (see
 behaves like {cmd:sample2, cluster()}: units are the clusters, {opt any}/{opt all}
 resolve units split by {it:if}/{it:in}, and {opt generate()} (alias
 {opt keep()}) returns an indicator instead of deleting rows.
+
+{pstd}
+Unit samples are not promised to match {cmd:sample2, cluster()} observation
+for observation: their keys are assigned by sorted unit values. A missing
+cluster identifier forms a cluster in {cmd:sample2}; in {cmd:xsamplefe}, missing
+unit identifiers are outside the frame and their rows are kept.
 
 {pstd}
 On top of that, {cmd:xsamplefe} adds
@@ -132,8 +226,9 @@ compiler runtime). The result never depends on the number of threads.
 {pstd}
 The {it:sampling unit} is determined in this order: {opt unit()} if specified;
 otherwise the {opt group()} variable; otherwise the first {opt absorb()}
-variable; otherwise single observations. Units are the clusters that are kept
-or dropped as a whole. For an AKM-style regression,
+variable; otherwise single observations. Units are kept or dropped as a whole
+unless a different {opt group()} applies the closure described below.
+For an AKM-style regression,
 {cmd:absorb(worker firm year)} samples workers with all their spells; with
 {cmd:unit(firm)} it samples firms with all their observations.
 
@@ -149,8 +244,9 @@ these rules apply to groups.
 {it:Eligibility.} Among the units in the frame, only those meeting
 {opt balanced}, {opt minperiods()}, {opt maxperiods()}, {opt minobs()},
 {opt maxobs()}, {opt minmobility()} and {opt maxmobility()} are eligible.
-Ineligible units are {it:dropped} (they are not part of the population being
-sampled); their count is reported and stored. Per-unit statistics are computed
+Ineligible units are excluded from the draw and their rows are dropped, except
+when a group closure retains those rows; their count is reported and stored.
+Per-unit statistics are computed
 on the frame rows of the unit: number of rows, number of distinct
 {opt time()} values, number of distinct {opt mobility()} values. Missing
 {opt time()} or {opt mobility()} values never count as a period or a link, and
@@ -194,6 +290,13 @@ fewer than their frame rows;{p_end}
 {cmd:reconnect} may not be combined with a group closure.
 
 {pstd}
+{it:Inference.} The command returns a retention indicator and diagnostics, not
+survey-design or inclusion-probability weights. Unequal rates, group closure,
+{opt reconnect} and pruning can change the target population. Ordinary
+unweighted estimation on such a sample does not automatically recover the
+full-data moments; choose the sampling design and inference for the estimand.
+
+{pstd}
 {it:Connected set.} {opt connected} builds the bipartite graph between units
 and {opt mobility()} values on the retained frame rows and keeps only its
 largest component (measured in rows; ties go to the component containing the
@@ -219,11 +322,16 @@ stratum. Consequently, after {cmd:set seed} {it:#}:
 
 {p 8 12 2}- {cmd:xsamplefe} {it:#} [{it:if}] [{cmd:, by() count}] retains exactly the observations that {cmd:sample}
 {it:#} [{it:if}] [{cmd:, by() count}] retains, and leaves the random-number generator in the same state
-({cmd:sample 100} and {cmd:count} with {it:#} {ul:>} {cmd:_N} draw nothing in both commands);{p_end}
+({cmd:sample 100} and {cmd:count} with {it:#} {cmd:>=} {cmd:_N} draw nothing in both commands);{p_end}
 {p 8 12 2}- unit-level samples depend only on the seed and on the {it:set} of unit values in the frame (the {it:r}-th
-smallest unit value receives the {it:r}-th draw), so they are invariant to the physical order of the data and to the
-number of rows each unit has;{p_end}
+smallest unit value receives the {it:r}-th draw). Changing row order leaves the draw unchanged. Changing the number
+of rows per unit does too when eligibility, strata and the subsequent retention rules stay the same;{p_end}
 {p 8 12 2}- results are invariant to {opt numthreads()}.{p_end}
+
+{pstd}
+Failed plugin calls, including split-frame or inconsistent-stratum errors, and
+plugin loading failures restore the random-number state from before the call,
+including when {opt seed()} was supplied.
 
 {pstd}
 The second and further uniform columns start at draw {cmd:_N}+1, so unit-level
@@ -262,9 +370,11 @@ that a {cmd:reghdfe} call can be pasted unchanged.
 {pstd}
 Whole-unit sampling keeps every spell of a drawn unit, so the mobility of each
 retained unit (distinct {opt mobility()} values, transitions) is exactly the
-one in the population, and the shares of movers and of the mobility classes in
-the sample are unbiased. It does {it:not} guarantee the exact composition of
-the sample, nor that the sample stays connected (see
+one in the sampling frame, provided no group closure makes units partial.
+A simple random sample of eligible units estimates their mobility-class shares
+without systematic selection; stratification, unequal rates and subsequent
+retention rules change that design. No mode guarantees the exact composition of
+the full dataset, nor that the sample stays connected (see
 {help xsamplefe##connectivity:Connectivity}). To hold the mobility classes
 close to the population, stratify by the number of distinct mobility values
 per unit, either with {opt mobstrata} or by building the class by hand:
@@ -304,7 +414,8 @@ sampled, before the draw) and on the {it:final sample}.
 {cmd:r(lcc_mobility_share)} the second, and {cmd:r(N_units_lcc_kept)} counts
 the retained units that were in the frame's largest component and are still in
 the sample's largest one. {opt connected} and {opt reconnect} need the same
-graphs and report them too; without one of the three the seven results are
+graphs and report them too, as does {opt minmovers()}; without any of these
+options the seven graph results are
 missing and no graph is built, because each one costs a serial union-find over
 every frame row.
 
@@ -335,7 +446,9 @@ what was added. On the two benchmarks above, {opt reconnect} restores 76.0 and
 {pstd}
 {it:The price is size and composition, and it is large.} The gain rule prefers,
 by construction, the units that join the most rows, that is the hubs; the added
-units are movers by construction; and there is no bound on how many are needed.
+units may be movers or stayers already linked to the component. Adding stayers
+can increase its row share without joining previously disconnected components.
+The target may remain unattained when the eligible frontier is exhausted.
 Measured on a 10 percent unit draw ({cmd:absorb(id1 id2)}, {cmd:set seed 1}):
 
 {p2colset 9 42 44 2}{...}
@@ -404,15 +517,18 @@ indivisible; adding a unit could split one).
 {title:Limited mobility bias}
 
 {pstd}
-Whole-unit sampling keeps the {it:parameters} of the population: the true
-variance decomposition of the sample is the population's. It does not keep the
-{it:precision} of a two-way fixed-effect estimator. AKM firm effects are
-unbiased one by one, but each is estimated with noise, and that noise inflates
-{cmd:Var(psi_hat)} and depresses {cmd:Cov(alpha_hat, psi_hat)}: the classic
-limited mobility bias (Bonhomme, Lamadon and Manresa, "The ABC of AKM",
-{it:Journal of Economic Perspectives}, 2026). Its size is governed by the
-number of {it:movers per mobility value}, which is exactly what a sample takes
-away, so {opt connectivity} reports that number too:
+Whole-unit sampling preserves the histories of selected units, not the exact
+moments or parameters of the full dataset. Even a simple random sample has
+sampling variation; eligibility filters, unequal rates and connectivity rules
+can change its composition systematically. Under the AKM model's exogeneity and
+identification assumptions, individual fixed-effect estimates can be unbiased
+while plug-in variance and covariance estimates remain biased by estimation
+noise. Sparse mobility can inflate {cmd:Var(psi_hat)} and depress
+{cmd:Cov(alpha_hat, psi_hat)}. See Bonhomme, Manresa and Lamadon (2026),
+{browse "https://arxiv.org/abs/2603.17034":The ABC of AKM}.
+Movers per mobility value are a useful diagnostic of this loss of information,
+not a sufficient condition for unbiased estimation. {opt connectivity} reports
+them too:
 {cmd:r(movers_per_mob_frame)} and {cmd:r(movers_per_mob)} give the mean over
 the mobility values present in the frame and in the sample, and
 {cmd:r(weak_mob_share_frame)} and {cmd:r(weak_mob_share)} the share of them
@@ -434,19 +550,20 @@ Measured on the calibrated panel of that article (6,000 workers, 300 firms,
 {p2colreset}{...}
 
 {pstd}
-Read the table as follows. The {it:true} columns barely move across the unit
-designs: the draw is faithful. The {it:AKM} columns do move: the estimated
+In this particular simulation, the {it:true} columns barely move across the
+simple unit designs. The {it:AKM} columns do move: the estimated
 {cmd:Var(psi)} is 5 percent above the truth on the full data, 20 percent at a
 quarter of the workers and 70 percent at a tenth, and drawing the same number
 of {it:rows} instead of units multiplies it by five and turns the covariance
 negative. Practical consequences:
 
-{p 8 12 2}- for coefficients on covariates, a unit sample is unbiased and only
-loses precision (see the Monte Carlo in {cmd:tests/xsamplefe_estimation_cert.do});{p_end}
-{p 8 12 2}- for a {it:variance decomposition} meant to be compared with the
-full data, sample the movers in full: {cmd:movers(100) stayers(#)} restores the
-full-data movers per firm and an essentially unbiased decomposition, of a
-{it:different} population (its own {cmd:2Cov} is 0.139 against 0.190);{p_end}
+{p 8 12 2}- coefficients on covariates still require the intended model's
+identification, exogeneity and variance assumptions. The Monte Carlo in
+{cmd:tests/xsamplefe_estimation_cert.do} illustrates one design, not a general guarantee;{p_end}
+{p 8 12 2}- {cmd:movers(100) stayers(#)} retains more information about firm
+effects but changes inclusion probabilities and the target composition. The
+small variance bias in this simulation is not a bias-correction method, nor a
+guarantee for other datasets (its true {cmd:2Cov} is 0.139 against 0.190);{p_end}
 {p 8 12 2}- {opt minmovers(#)} removes the mobility values that carry the most
 noise, but it does not remove the bias: on the same panel it takes the share of
 firms with at most one mover from 17 percent to zero and leaves the ratio
@@ -500,9 +617,12 @@ state is returned in {cmd:r(rngstate)}).
 sample is meant for, in {cmd:reghdfe} syntax: plain variables, {cmd:i.} prefixes,
 {cmd:#} interactions (compacted with {cmd:egen group()}), {it:name}{cmd:=}{it:var}
 labels and heterogeneous-slope terms ({cmd:fe#c.x}, {cmd:fe##c.(x z)},
-{cmd:fe##(c.x c.z)}, whose continuous parts are ignored). Names are expanded to
-their full spelling, so an abbreviation picks the same dimensions as the full
-name. Anything after a comma is discarded. The first entry is the default
+{cmd:fe##(c.x c.z)}, whose continuous parts do not define units). Plain wildcards
+and variable ranges expand to separate effects, not an interaction. Each
+categorical part of a {cmd:#} interaction must resolve to one variable.
+Abbreviations obey {cmd:set varabbrev}; use full names when it is off.
+An {opt absorb()} list without a categorical dimension requires an explicit
+{opt unit()} or {opt group()}. Anything after a comma is discarded. The first entry is the default
 sampling unit and the first other entry, excluding the {opt time()} variable,
 is the default {opt mobility()} dimension.
 
@@ -524,11 +644,14 @@ identifiers are compacted with {cmd:egen group()} first.
 {helpb xtset} time variable is used.
 
 {phang}{opt balanced} makes only units observed in every distinct period of the
-frame eligible; the sample is then a balanced panel.
+frame eligible. Missing and duplicate times can still be present in retained
+units; a group closure may bring back ineligible units. Check {cmd:isid} and
+the time variable before treating the result as an {cmd:xtset} balanced panel.
 
 {phang}{opt minperiods(#)}, {opt maxperiods(#)}, {opt minobs(#)} and
 {opt maxobs(#)} bound the number of distinct periods and the number of rows per
 unit. {it:#} must be a nonnegative integer; an omitted option is no bound.
+{opt minobs()} and {opt maxobs()} require a sampling unit.
 
 {dlgtab:Mobility structure}
 
@@ -588,8 +711,9 @@ the cost.
 {phang}{opt reconrule(gain|key)} chooses which frontier unit {opt reconnect}
 adds next: {cmd:gain} (default) the one that joins the most rows to the largest
 component, {cmd:key} the one with the smallest uniform key, that is in random
-order. {cmd:key} stays closer to the population composition and costs more rows
-and more time; see {help xsamplefe##connectivity:Connectivity} for the measured
+order. In the reported benchmarks, {cmd:key} is closer on some composition
+measures and costs more rows and time; this is not a general dominance result.
+See {help xsamplefe##connectivity:Connectivity} for the measured
 trade-off. Ties are broken the same way in both cases (the key, then the unit's
 rank), so both are deterministic and invariant to {opt numthreads()} and to the
 row order. Specifying it implies {opt reconnect}.
@@ -619,12 +743,24 @@ for any realistic sample size under the {cmd:mt64} generator.
 {marker examples}{...}
 {title:Examples}
 
+{pstd}
+Two self-contained courses are included: {cmd:xsamplefe_basics.do} (observations,
+workers, strata, filters and estimation) and {cmd:xsamplefe_tour.do} (mobility,
+connectivity and teams). Both create artificial data and require only this
+package. Save your current data before running them. In a source checkout they
+are in {cmd:stata/}; with a net installation, retrieve the ancillary files from
+the same installation location:
+
+{phang2}{cmd:. net get xsamplefe, from("https://github.com/reisportela/xsamplefe/releases/latest/download")}{p_end}
+{phang2}{cmd:. do xsamplefe_basics.do}{p_end}
+{phang2}{cmd:. do xsamplefe_tour.do}{p_end}
+
 {pstd}Same draws as {cmd:sample}{p_end}
 {phang2}{cmd:. sysuse auto, clear}{p_end}
 {phang2}{cmd:. set seed 1}{p_end}
 {phang2}{cmd:. xsamplefe 10, by(foreign)}{p_end}
 
-{pstd}10 percent of the workers, with all their spells, for an AKM regression{p_end}
+{pstd}10 percent of workers, with all their observations; industry is a sector, not a firm identifier{p_end}
 {phang2}{cmd:. webuse nlswork, clear}{p_end}
 {phang2}{cmd:. set seed 1}{p_end}
 {phang2}{cmd:. xsamplefe 10, absorb(idcode ind_code year)}{p_end}
@@ -634,20 +770,34 @@ for any realistic sample size under the {cmd:mt64} generator.
 {phang2}{cmd:. webuse nlswork, clear}{p_end}
 {phang2}{cmd:. xsamplefe 50, absorb(idcode year) time(year) balanced generate(insample)}{p_end}
 
-{pstd}All movers and 5 percent of the stayers, restricted to the largest connected component{p_end}
+{pstd}On the same NLS data: all industry movers and 5 percent of stayers, within the largest component{p_end}
+{phang2}{cmd:. webuse nlswork, clear}{p_end}
 {phang2}{cmd:. xsamplefe 5, absorb(idcode ind_code year) movers(100) stayers(5) connected}{p_end}
 
 {pstd}Patents with several inventors ({cmd:reghdfe, group() individual()}): 20 percent of the patents, whole teams{p_end}
-{phang2}{cmd:. use toy-patents-long, clear}{p_end}
+{pstd}The long-format data must already contain {cmd:patent_id}, {cmd:inventor_id}, {cmd:citations} and {cmd:funding};
+outcomes and group-level regressors must be constant within each patent. The artificial team example in
+{cmd:xsamplefe_tour.do} illustrates the sampling layout.{p_end}
 {phang2}{cmd:. xsamplefe 20, absorb(inventor_id) group(patent_id) individual(inventor_id)}{p_end}
-{phang2}{cmd:. reghdfe citations funding, absorb(inventor_id) group(patent_id) individual(inventor_id)}{p_end}
+{phang2}{cmd:. sort patent_id inventor_id}{p_end}
+{phang2}{cmd:. reghdfe citations funding, absorb(inventor_id) group(patent_id) individual(inventor_id) tolerance(1e-12)}{p_end}
+
+{pstd}
+For grouped estimation, check {cmd:isid} {it:group individual} and the constancy
+of group-level variables. The audit reproduced order-sensitive results from
+{cmd:reghdfe} 6.14.1 on one group-individual design: reversing the same sample
+changed its estimates even with a tight tolerance. Ascending group/individual
+order and {cmd:tolerance(1e-12)} in both estimators gave agreement there.
+{cmd:xsamplefe} itself preserves the incoming row order; it does not perform
+that sorting or validate the downstream estimator's convergence.
 
 {pstd}Same design, sampling inventors and keeping every patent they appear in; here the unit is the inventor, so
 {opt minmobility()}/{opt maxmobility()} bound the number of {it:patents per inventor}, not the team size (for teams of
 2 to 5 sample the patents: {cmd:unit(patent_id) minmobility(2) maxmobility(5)}){p_end}
 {phang2}{cmd:. xsamplefe 20, group(patent_id) individual(inventor_id) unit(inventor_id) minmobility(2) maxmobility(5) generate(s)}{p_end}
 
-{pstd}How connected the population is, and how connected a 10 percent worker sample would be{p_end}
+{pstd}On a worker-firm panel already in memory with variables {cmd:worker}, {cmd:firm} and {cmd:year}:
+compare connectivity before and after a 10 percent worker draw{p_end}
 {phang2}{cmd:. xsamplefe 10, absorb(worker firm year) connectivity generate(s)}{p_end}
 
 {pstd}A 10 percent worker sample that keeps the largest component as large, in share of its rows, as it is in the
@@ -670,7 +820,7 @@ population (and can therefore be much larger than 10 percent){p_end}
 {synopt:{cmd:r(N_total)}}observations in the dataset{p_end}
 {synopt:{cmd:r(N_frame)}}observations in the sampling frame{p_end}
 {synopt:{cmd:r(N_outside)}}observations outside the frame (kept){p_end}
-{synopt:{cmd:r(N_ineligible)}}frame observations of ineligible units (dropped){p_end}
+{synopt:{cmd:r(N_ineligible)}}frame observations of ineligible units before any group closure{p_end}
 {synopt:{cmd:r(N_frame_retained)}}frame observations retained{p_end}
 {synopt:{cmd:r(N_connected_dropped)}}observations dropped by {opt connected}{p_end}
 {synopt:{cmd:r(n_components)}}connected components found by {opt connected}{p_end}
@@ -685,7 +835,7 @@ are not counted{p_end}
 {synopt:{cmd:r(N_movers_eligible)}, {cmd:r(N_movers_sampled)}, {cmd:r(N_movers_retained)}}movers among eligible / drawn / retained units{p_end}
 {synopt:{cmd:r(N_units_split)}}units (or groups) split by {it:if}/{it:in} and resolved by {opt any}/{opt all}{p_end}
 {synopt:{cmd:r(N_target)}}total number of units targeted by the rates{p_end}
-{synopt:{cmd:r(N_strata)}, {cmd:r(N_strata_final)}}{opt by()} strata, and non-empty strata after the mover split{p_end}
+{synopt:{cmd:r(N_strata)}, {cmd:r(N_strata_final)}}{opt by()} strata, and non-empty eligible strata after {opt mobstrata} and rate splits{p_end}
 {synopt:{cmd:r(N_periods)}}distinct {opt time()} values in the frame{p_end}
 {synopt:{cmd:r(N_mobility)}, {cmd:r(N_mobility_retained)}}distinct {opt mobility()} values in the frame / in the retained frame rows{p_end}
 {synopt:{cmd:r(N_groups)}, {cmd:r(N_groups_kept)}, {cmd:r(N_groups_retained)}}groups in the frame / kept by the closure rule / with retained rows{p_end}
@@ -710,10 +860,10 @@ diagnostics{p_end}
 
 {pstd}
 Results that do not apply are missing ({cmd:.}): {cmd:r(N_periods)} without
-{opt time()}, the mobility results without a mobility dimension,
+{opt time()}, {cmd:r(N_mobility)} and {cmd:r(N_mobility_retained)} without a mobility dimension,
 {cmd:r(N_groups*)} without {opt group()}, the {opt reconnect} counts without
 {opt reconnect}, the {opt minmovers()} counts without {opt minmovers()}, and
-the eleven connectivity results ({cmd:r(N_components_frame)},
+the seven graph results ({cmd:r(N_components_frame)},
 {cmd:r(lcc_share_frame)}, {cmd:r(N_components)}, {cmd:r(lcc_share)},
 {cmd:r(lcc_units_share)}, {cmd:r(lcc_mobility_share)},
 {cmd:r(N_units_lcc_kept)}) unless {opt connectivity}, {opt connected},
@@ -722,7 +872,8 @@ movers-per-value results ({cmd:r(movers_per_mob_frame)},
 {cmd:r(movers_per_mob)}, {cmd:r(weak_mob_share_frame)},
 {cmd:r(weak_mob_share)}) unless {opt connectivity} or {opt minmovers()} was. Zero
 means zero. {cmd:r(n_components)} keeps its own meaning: the components found
-by {opt connected}, missing without it.
+by {opt connected}, zero without it. The three {cmd:r(N_movers_*)} counts are
+also zero without a mobility dimension.
 
 {p2col 5 26 30 2: Macros}{p_end}
 {synopt:{cmd:r(cmd)}}{cmd:xsamplefe}{p_end}
