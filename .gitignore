@@ -1,0 +1,36 @@
+# Local agent instructions and developer prompts: never published
+AGENTS.md
+CLAUDE.md
+prompts/
+.claude/
+.codex/
+.codex*
+.agent_backups/
+
+# Compiled plugin binaries (platform-specific build outputs)
+*.plugin
+*.o
+*.so
+*.dll
+*.dylib
+stata/tools/_build/
+
+# Stata run artifacts
+*.log
+*.smcl
+*.gph
+*.dta
+*.parquet
+tests/output/
+benchmarks/_out/
+benchmarks/results/*.log
+
+# Editors, OS, scratch
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*~
+*.swp
+_tmp*/
+.tmp*/

@@ -1,0 +1,4 @@
+dataset,N,fes,units,units_sampled,N_unit_sample,t_unit16,t_unit48,t_unit1,det_ok,integrity_ok,t_obs,t_sample,parity_ok,xhdfe_N,xhdfe_conv,xhdfe_t
+akm_v02_firstreg,57821050,idtrab ano NPC_FIC,7705610,770561,5793241,16.911,13.319,20.713,1,1,10.308,21.048,1,5533175,1,11.839
+akm_v02_secondreg_data,57821050,idtrab ano NPC_FIC,7705610,770561,5793241,14.685,11.278,14.7,1,1,8.952999999999999,24.566,1,5533175,1,11.241
+simulated_panel,173163263,worker_id firm_id occupation_id year,20000000,2000000,17312023,29.19,29.604,64.801,1,1,29.525,52.687,1,17311387,1,16.406
