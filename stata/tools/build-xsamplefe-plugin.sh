@@ -176,7 +176,7 @@ elif [[ "$TARGET" == macos ]]; then
   need lipo; need otool
   if [[ "$OPENMP_MODE" == on ]]; then
     [[ -f "${OMP_PREFIX}/include/omp.h" && -f "${OMP_PREFIX}/lib/libomp.dylib" ]] || fail "libomp headers/library missing under $OMP_PREFIX"
-    lipo -verify_arch "$ARCH" "${OMP_PREFIX}/lib/libomp.dylib" || fail "libomp does not contain $ARCH; select the matching LIBOMP_PREFIX"
+    lipo "${OMP_PREFIX}/lib/libomp.dylib" -verify_arch "$ARCH" || fail "libomp does not contain $ARCH; select the matching LIBOMP_PREFIX"
   fi
 else
   need readelf
@@ -210,7 +210,7 @@ case "$TARGET" in
       fail "Windows output depends on a non-static GNU/MSYS runtime"
     fi ;;
   macos)
-    lipo -verify_arch "$ARCH" "${WORK_DIR}/xsamplefe.plugin"
+    lipo "${WORK_DIR}/xsamplefe.plugin" -verify_arch "$ARCH"
     if [[ "$OPENMP_MODE" == on ]]; then
       dynamic="$(otool -L "${WORK_DIR}/xsamplefe.plugin")"
       [[ "$dynamic" == *libomp.dylib* ]] || fail "output has no libomp dependency"

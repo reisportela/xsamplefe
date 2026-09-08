@@ -37,7 +37,7 @@ def collect(platform, out):
         # The plugin now resolves libomp beside itself, independently of Homebrew.
         subprocess.run(["install_name_tool", "-delete_rpath", str(prefix / "lib"), str(plugin)], check=True)
         for path in (runtime, plugin):
-            subprocess.run(["lipo", "-verify_arch", arch, str(path)], check=True)
+            subprocess.run(["lipo", str(path), "-verify_arch", arch], check=True)
             subprocess.run(["codesign", "--force", "--sign", "-", str(path)], check=True)
             subprocess.run(["codesign", "--verify", "--strict", str(path)], check=True)
             for line in command("otool", "-L", str(path)).splitlines()[1:]:
