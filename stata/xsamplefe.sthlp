@@ -56,7 +56,8 @@
 {synopt :{opt mino:bs(#)}, {opt maxo:bs(#)}}bounds on the number of observations per unit{p_end}
 
 {syntab:Mobility structure}
-{synopt :{opth mob:ility(varname)}}dimension across which units move (default: second {opt absorb()} variable, or the {opt individual()}/{opt group()} counterpart){p_end}
+{synopt :{opth mob:ility(varname)}}dimension across which units move (default: second {opt absorb()} variable, or the
+{opt individual()}/{opt group()} counterpart){p_end}
 {synopt :{opt minm:obility(#)}, {opt maxm:obility(#)}}bounds on the number of distinct {opt mobility()} values per unit{p_end}
 {synopt :{opt mov:ers(#)}, {opt stay:ers(#)}}separate sampling rates (or counts) for movers and stayers{p_end}
 {synopt :{opt mobstr:ata}}add the number of distinct {opt mobility()} values per unit to the {opt by()} strata{p_end}
@@ -111,8 +112,11 @@ On top of that, {cmd:xsamplefe} adds
 
 {p 8 12 2}- stratified samples ({opt by()}) whose strata must be constant within units;{p_end}
 {p 8 12 2}- panel eligibility filters: balanced panels, minimum/maximum number of periods or observations per unit;{p_end}
-{p 8 12 2}- mobility structure: bounds on the number of distinct values of a second dimension per unit (firms per worker, inventors per patent, ...), separate rates for movers and stayers, and an optional restriction to the largest connected component;{p_end}
-{p 8 12 2}- {cmd:reghdfe, group() individual()} designs (patents-inventors, papers-authors, groups of workers): rows of a group are never separated, whichever unit is sampled.{p_end}
+{p 8 12 2}- mobility structure: bounds on the number of distinct values of a second dimension per unit (firms per
+worker, inventors per patent, ...), separate rates for movers and stayers, and an optional restriction to the largest
+connected component;{p_end}
+{p 8 12 2}- {cmd:reghdfe, group() individual()} designs (patents-inventors, papers-authors, groups of workers): rows of
+a group are never separated, whichever unit is sampled.{p_end}
 
 {pstd}
 All the work is done by a C++ plugin ({cmd:xsamplefe.plugin}) that uses
@@ -176,9 +180,13 @@ or only when {cmd:all} of them were ({opt grouprule(all)}). Groups are the
 indivisible blocks, so the closure overrides the unit-level decisions and has
 three consequences that are reported rather than prevented:
 
-{p 8 12 2}- a unit that was {it:not} drawn keeps every row it has in a retained group, and an {it:ineligible} unit (one the filters had dropped) comes back the same way: {cmd:r(N_units_ineligible_retained)} counts them;{p_end}
-{p 8 12 2}- a unit that {it:was} drawn can end up with only part of its rows, because some of its groups were not kept (this is the normal outcome of {opt grouprule(all)}): {cmd:r(N_units_partial)} counts the units whose retained rows are fewer than their frame rows;{p_end}
-{p 8 12 2}- {cmd:r(N_movers_retained)} classifies a retained unit as a mover using the mobility it has {it:in the frame}, not the mobility left in the sample after the closure.{p_end}
+{p 8 12 2}- a unit that was {it:not} drawn keeps every row it has in a retained group, and an {it:ineligible} unit (one
+the filters had dropped) comes back the same way: {cmd:r(N_units_ineligible_retained)} counts them;{p_end}
+{p 8 12 2}- a unit that {it:was} drawn can end up with only part of its rows, because some of its groups were not kept
+(this is the normal outcome of {opt grouprule(all)}): {cmd:r(N_units_partial)} counts the units whose retained rows are
+fewer than their frame rows;{p_end}
+{p 8 12 2}- {cmd:r(N_movers_retained)} classifies a retained unit as a mover using the mobility it has
+{it:in the frame}, not the mobility left in the sample after the closure.{p_end}
 
 {pstd}
 {cmd:reconnect} may not be combined with a group closure.
@@ -207,8 +215,12 @@ see {opt pduplicates()}; {cmd:double} columns, or the two {cmd:float} columns
 fewer than 2^31 observations), and selects the smallest keys within each
 stratum. Consequently, after {cmd:set seed} {it:#}:
 
-{p 8 12 2}- {cmd:xsamplefe} {it:#} [{it:if}] [{cmd:, by() count}] retains exactly the observations that {cmd:sample} {it:#} [{it:if}] [{cmd:, by() count}] retains, and leaves the random-number generator in the same state ({cmd:sample 100} and {cmd:count} with {it:#} {ul:>} {cmd:_N} draw nothing in both commands);{p_end}
-{p 8 12 2}- unit-level samples depend only on the seed and on the {it:set} of unit values in the frame (the {it:r}-th smallest unit value receives the {it:r}-th draw), so they are invariant to the physical order of the data and to the number of rows each unit has;{p_end}
+{p 8 12 2}- {cmd:xsamplefe} {it:#} [{it:if}] [{cmd:, by() count}] retains exactly the observations that {cmd:sample}
+{it:#} [{it:if}] [{cmd:, by() count}] retains, and leaves the random-number generator in the same state
+({cmd:sample 100} and {cmd:count} with {it:#} {ul:>} {cmd:_N} draw nothing in both commands);{p_end}
+{p 8 12 2}- unit-level samples depend only on the seed and on the {it:set} of unit values in the frame (the {it:r}-th
+smallest unit value receives the {it:r}-th draw), so they are invariant to the physical order of the data and to the
+number of rows each unit has;{p_end}
 {p 8 12 2}- results are invariant to {opt numthreads()}.{p_end}
 
 {pstd}
@@ -550,13 +562,16 @@ for any realistic sample size under the {cmd:mt64} generator.
 {phang2}{cmd:. xsamplefe 20, absorb(inventor_id) group(patent_id) individual(inventor_id)}{p_end}
 {phang2}{cmd:. reghdfe citations funding, absorb(inventor_id) group(patent_id) individual(inventor_id)}{p_end}
 
-{pstd}Same design, sampling inventors and keeping every patent they appear in; here the unit is the inventor, so {opt minmobility()}/{opt maxmobility()} bound the number of {it:patents per inventor}, not the team size (for teams of 2 to 5 sample the patents: {cmd:unit(patent_id) minmobility(2) maxmobility(5)}){p_end}
+{pstd}Same design, sampling inventors and keeping every patent they appear in; here the unit is the inventor, so
+{opt minmobility()}/{opt maxmobility()} bound the number of {it:patents per inventor}, not the team size (for teams of
+2 to 5 sample the patents: {cmd:unit(patent_id) minmobility(2) maxmobility(5)}){p_end}
 {phang2}{cmd:. xsamplefe 20, group(patent_id) individual(inventor_id) unit(inventor_id) minmobility(2) maxmobility(5) generate(s)}{p_end}
 
 {pstd}How connected the population is, and how connected a 10 percent worker sample would be{p_end}
 {phang2}{cmd:. xsamplefe 10, absorb(worker firm year) connectivity generate(s)}{p_end}
 
-{pstd}A 10 percent worker sample that keeps the largest component as large, in share of its rows, as it is in the population (and can therefore be much larger than 10 percent){p_end}
+{pstd}A 10 percent worker sample that keeps the largest component as large, in share of its rows, as it is in the
+population (and can therefore be much larger than 10 percent){p_end}
 {phang2}{cmd:. xsamplefe 10, absorb(worker firm year) reconnect}{p_end}
 {phang2}{cmd:. display r(lcc_share_frame), r(lcc_share), r(N_units_reconnected)}{p_end}
 
@@ -582,7 +597,9 @@ for any realistic sample size under the {cmd:mt64} generator.
 {synopt:{cmd:r(N_units)}}units in the frame (observations when there is no unit){p_end}
 {synopt:{cmd:r(N_units_eligible)}, {cmd:r(N_units_ineligible)}}eligible / ineligible units{p_end}
 {synopt:{cmd:r(N_units_sampled)}}units drawn{p_end}
-{synopt:{cmd:r(N_units_retained)}}units of the frame with at least one retained row (after group closure, {opt reconnect} and {opt connected}); rows outside {it:if}/{it:in} are kept but their units are not in the frame and are not counted{p_end}
+{synopt:{cmd:r(N_units_retained)}}units of the frame with at least one retained row (after group closure,
+{opt reconnect} and {opt connected}); rows outside {it:if}/{it:in} are kept but their units are not in the frame and
+are not counted{p_end}
 {synopt:{cmd:r(N_units_partial)}}units with some, but not all, of their frame rows retained (only the group closure can produce these){p_end}
 {synopt:{cmd:r(N_units_ineligible_retained)}}ineligible units brought back by the group closure{p_end}
 {synopt:{cmd:r(N_movers_eligible)}, {cmd:r(N_movers_sampled)}, {cmd:r(N_movers_retained)}}movers among eligible / drawn / retained units{p_end}
@@ -592,14 +609,18 @@ for any realistic sample size under the {cmd:mt64} generator.
 {synopt:{cmd:r(N_periods)}}distinct {opt time()} values in the frame{p_end}
 {synopt:{cmd:r(N_mobility)}, {cmd:r(N_mobility_retained)}}distinct {opt mobility()} values in the frame / in the retained frame rows{p_end}
 {synopt:{cmd:r(N_groups)}, {cmd:r(N_groups_kept)}, {cmd:r(N_groups_retained)}}groups in the frame / kept by the closure rule / with retained rows{p_end}
-{synopt:{cmd:r(N_components_frame)}, {cmd:r(lcc_share_frame)}}with {opt connectivity}, {opt connected} or {opt reconnect}: components of the unit-mobility graph on the eligible frame, and the share of its rows in the largest one{p_end}
+{synopt:{cmd:r(N_components_frame)}, {cmd:r(lcc_share_frame)}}with {opt connectivity}, {opt connected} or
+{opt reconnect}: components of the unit-mobility graph on the eligible frame, and the share of its rows in the largest
+one{p_end}
 {synopt:{cmd:r(N_components)}, {cmd:r(lcc_share)}}the same on the final sample{p_end}
 {synopt:{cmd:r(lcc_units_share)}, {cmd:r(lcc_mobility_share)}}share of the sample's units / {opt mobility()} values in its largest component{p_end}
 {synopt:{cmd:r(N_units_lcc_kept)}}retained units that were in the frame's largest component and are in the sample's largest one{p_end}
-{synopt:{cmd:r(N_units_reconnected)}, {cmd:r(N_reconnected)}}units and observations added by {opt reconnect} (totals, not broken down by {opt by()} stratum){p_end}
+{synopt:{cmd:r(N_units_reconnected)}, {cmd:r(N_reconnected)}}units and observations added by {opt reconnect} (totals,
+not broken down by {opt by()} stratum){p_end}
 {synopt:{cmd:r(pct)} or {cmd:r(count)}}the {it:#} specified{p_end}
 {synopt:{cmd:r(n_uniforms)}}number of uniform key columns drawn{p_end}
-{synopt:{cmd:r(threads_requested)}, {cmd:r(threads_effective)}, {cmd:r(threads_used)}, {cmd:r(thread_capacity)}, {cmd:r(openmp_enabled)}}OpenMP diagnostics{p_end}
+{synopt:{cmd:r(threads_requested)}, {cmd:r(threads_effective)}, {cmd:r(threads_used)}, {cmd:r(thread_capacity)}, {cmd:r(openmp_enabled)}}OpenMP
+diagnostics{p_end}
 
 {pstd}
 Results that do not apply are missing ({cmd:.}): {cmd:r(N_periods)} without
@@ -616,7 +637,8 @@ by {opt connected}, missing without it.
 {p2col 5 26 30 2: Macros}{p_end}
 {synopt:{cmd:r(cmd)}}{cmd:xsamplefe}{p_end}
 {synopt:{cmd:r(unit)}, {cmd:r(mobility)}, {cmd:r(time)}, {cmd:r(by)}, {cmd:r(group)}, {cmd:r(individual)}, {cmd:r(absorb)}}dimensions used{p_end}
-{synopt:{cmd:r(frame_rule)}, {cmd:r(grouprule)}, {cmd:r(reconrule)}}{cmd:strict}/{cmd:any}/{cmd:all}, the group closure rule and the {opt reconnect} frontier rule{p_end}
+{synopt:{cmd:r(frame_rule)}, {cmd:r(grouprule)}, {cmd:r(reconrule)}}{cmd:strict}/{cmd:any}/{cmd:all}, the group closure
+rule and the {opt reconnect} frontier rule{p_end}
 {synopt:{cmd:r(generate)}}indicator variable, if any{p_end}
 {synopt:{cmd:r(rngstate)}}random-number state before drawing{p_end}
 {p2colreset}{...}

@@ -33,6 +33,24 @@ if [[ "${XSAMPLEFE_BUILD_PLUGIN:-0}" == "1" ]]; then
   bash "${REPO_ROOT}/stata/tools/build-xsamplefe-plugin.sh" ${XSAMPLEFE_BUILD_ARGS:-}
 fi
 
+# Help lint: Stata's GUI Viewer truncates SMCL source lines at 245 characters
+# and a cut inside a directive breaks the rendering from there on (translate
+# does not catch it). Refuse lines over 160 bytes, unbalanced braces on a
+# physical line, CR line endings and invalid UTF-8.
+HELP_FILE="${REPO_ROOT}/stata/xsamplefe.sthlp"
+if ! iconv -f UTF-8 -t UTF-8 "${HELP_FILE}" >/dev/null 2>&1; then
+  echo "help lint: ${HELP_FILE} is not valid UTF-8" >&2; exit 1
+fi
+if grep -q $'\r' "${HELP_FILE}"; then
+  echo "help lint: ${HELP_FILE} has CR line endings" >&2; exit 1
+fi
+if ! LC_ALL=C awk -v f="${HELP_FILE}" '
+  length($0) > 160 { printf "help lint: %s:%d: line has %d bytes (max 160)\n", f, NR, length($0) > "/dev/stderr"; bad = 1 }
+  { o = gsub(/{/, "{"); c = gsub(/}/, "}"); if (o != c) { printf "help lint: %s:%d: unbalanced braces\n", f, NR > "/dev/stderr"; bad = 1 } }
+  END { exit bad }' "${HELP_FILE}"; then
+  exit 1
+fi
+
 export XSAMPLEFE_TEST_DIR="${SCRIPT_DIR}"
 export XSAMPLEFE_ADOPATH="${XSAMPLEFE_ADOPATH:-${REPO_ROOT}/stata}"
 if [[ -z "${XHDFE_ADOPATH:-}" && -f "${REPO_ROOT}/../xhdfe/stata/xhdfe.ado" ]]; then

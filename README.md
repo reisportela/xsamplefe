@@ -199,6 +199,11 @@ XHDFE_ADOPATH=/path/to/xhdfe/stata bash tests/run_tests.sh   # adds the reghdfe/
 bash tests/selftest.sh                      # checks that the harness reports a failure
 ```
 
+`run_tests.sh` first lints the help file (no SMCL source line over 160 bytes,
+balanced braces on every line): Stata's GUI Viewer truncates lines at 245
+characters and a cut inside a directive garbles the rest of the page, which
+`translate` does not detect.
+
 `tests/selftest.sh` is the self-test of the harness: it runs `run_tests.sh`
 once with `XSAMPLEFE_SELFTEST=1`, which injects
 `tests/xsamplefe_selftest_fail.do` (one deliberately false assert) before the
