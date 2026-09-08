@@ -17,7 +17,10 @@ if (`"`adopath'"' == "") {
     local adopath "`testdir'/../stata"
 }
 
+local xhdfe_adopath : env XHDFE_ADOPATH
+
 discard
+if (`"`xhdfe_adopath'"' != "") adopath ++ `"`xhdfe_adopath'"'
 adopath ++ `"`adopath'"'
 capture which xsamplefe
 if (c(rc)) {
@@ -30,11 +33,41 @@ if (c(rc)) {
     di as error "reghdfe not found: install it (ssc install reghdfe) to run the certification."
     exit 601
 }
+capture which sample2
+if (c(rc)) {
+    di as error "sample2 not found: install it (net install dm46, from(http://www.stata.com/stb/stb37)) to run the certification."
+    exit 601
+}
+
+* harness self-test (tests/selftest.sh): inject a failing certification file
+* before the real ones; unset, this changes nothing
+local selftest : env XSAMPLEFE_SELFTEST
+if ("`selftest'" == "1") {
+    di as text _n "{hline 72}"
+    di as text "Running xsamplefe_selftest_fail.do (harness self-test)"
+    di as text "{hline 72}"
+    do "`testdir'/xsamplefe_selftest_fail.do"
+}
 
 di as text _n "{hline 72}"
 di as text "Running xsamplefe_cert.do"
 di as text "{hline 72}"
 do "`testdir'/xsamplefe_cert.do"
+
+di as text _n "{hline 72}"
+di as text "Running xsamplefe_compat_cert.do"
+di as text "{hline 72}"
+do "`testdir'/xsamplefe_compat_cert.do"
+
+di as text _n "{hline 72}"
+di as text "Running xsamplefe_estimation_cert.do"
+di as text "{hline 72}"
+do "`testdir'/xsamplefe_estimation_cert.do"
+
+di as text _n "{hline 72}"
+di as text "Running xsamplefe_mobility_cert.do"
+di as text "{hline 72}"
+do "`testdir'/xsamplefe_mobility_cert.do"
 
 di as text _n "{hline 72}"
 di as text "XSAMPLEFE CERTIFICATION TESTS COMPLETED SUCCESSFULLY"

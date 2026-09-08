@@ -1,3 +1,3 @@
 v 3
-d xsamplefe 1.0.0: random samples of panel / fixed-effect data for reghdfe and xhdfe
-p xsamplefe xsamplefe 1.0.0: random samples of panel / fixed-effect data for reghdfe and xhdfe via a C++ plugin
+d xsamplefe 1.1.0: random samples of panel / fixed-effect data for reghdfe and xhdfe
+p xsamplefe xsamplefe 1.1.0: random samples of panel / fixed-effect data for reghdfe and xhdfe via a C++ plugin

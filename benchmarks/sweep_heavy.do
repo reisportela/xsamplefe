@@ -30,8 +30,8 @@ file write R "dataset,N,fes,units,units_sampled,N_unit_sample,t_unit16,t_unit48,
 file close R
 global SWEEP_OUT "`OUT'"
 
-capture program drop xsf_heavy
-program define xsf_heavy
+capture program drop xsf_heavy_body
+program define xsf_heavy_body
     args name fes y xs clvar
     di as result _n "===================== `name' ====================="
     local N = _N
@@ -99,10 +99,31 @@ program define xsf_heavy
     file close R
 end
 
-pq use using "`AKM1'", clear
-capture noisily xsf_heavy akm_v02_firstreg "idtrab ano NPC_FIC" ln_wgain_hour_wz "exp_akm exp_akm_sq_100 exp_akm_cu_1000 exp_akm_qt_10000 firm_seniority_obs firm_seniority_spline10" idtrab
-pq use using "`AKM2'", clear
-capture noisily xsf_heavy akm_v02_secondreg_data "idtrab ano NPC_FIC" ln_wgain_hour_wz "exp_akm exp_akm_sq_100 exp_akm_cu_1000 exp_akm_qt_10000" idtrab
-pq use worker_id year firm_id occupation_id education experience experience_sq union ln_wage using "`SIM'", clear
-capture noisily xsf_heavy simulated_panel "worker_id firm_id occupation_id year" ln_wage "education experience experience_sq union" worker_id
+
+* every case writes a row: on failure the dataset name and the rc are recorded
+capture program drop xsf_fail
+program define xsf_fail
+    args name rc
+    di as error "SWEEP `name': FAILED rc=`rc'"
+    file open R using "$SWEEP_OUT", write text append
+    file write R "`name',ERROR,rc=`rc'" _n
+    file close R
+end
+
+capture program drop xsf_heavy
+program define xsf_heavy
+    local name : word 1 of `0'
+    capture noisily xsf_heavy_body `0'
+    if (_rc) xsf_fail `name' `=_rc'
+end
+
+capture noisily pq use using "`AKM1'", clear
+if (_rc) xsf_fail akm_v02_firstreg `=_rc'
+else xsf_heavy akm_v02_firstreg "idtrab ano NPC_FIC" ln_wgain_hour_wz "exp_akm exp_akm_sq_100 exp_akm_cu_1000 exp_akm_qt_10000 firm_seniority_obs firm_seniority_spline10" idtrab
+capture noisily pq use using "`AKM2'", clear
+if (_rc) xsf_fail akm_v02_secondreg_data `=_rc'
+else xsf_heavy akm_v02_secondreg_data "idtrab ano NPC_FIC" ln_wgain_hour_wz "exp_akm exp_akm_sq_100 exp_akm_cu_1000 exp_akm_qt_10000" idtrab
+capture noisily pq use worker_id year firm_id occupation_id education experience experience_sq union ln_wage using "`SIM'", clear
+if (_rc) xsf_fail simulated_panel `=_rc'
+else xsf_heavy simulated_panel "worker_id firm_id occupation_id year" ln_wage "education experience experience_sq union" worker_id
 di as result "HEAVY DONE"

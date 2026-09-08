@@ -1,9 +1,11 @@
-*! version 1.0.0  08sep2026
+*! version 1.1.0  08sep2026
 *! xsamplefe: panel / fixed-effect aware random sampling for reghdfe and xhdfe
 *! - sample / sample2 semantics for the simple cases (drawn rows are
 *!   bit-identical to sample under the same seed and data order)
 *! - whole-unit sampling aligned with absorb(), group() and individual()
 *! - strata, balanced panels, mobility structure and connected sets
+*! - connectivity diagnostics (connectivity) and reconnect for the largest
+*!   component of the unit-mobility graph
 *! - OpenMP C++ plugin (xsamplefe.plugin) with no external dependencies
 
 program define xsamplefe, rclass byable(onecall)
@@ -20,12 +22,14 @@ program define xsamplefe, rclass byable(onecall)
         MOBility(varname) ///
         TIME(varname) ///
         BALanced ///
-        MINobs(integer -1) MAXobs(integer -1) ///
-        MINPeriods(integer -1) MAXPeriods(integer -1) ///
-        MINMobility(integer -1) MAXMobility(integer -1) ///
+        MINObs(numlist max=1 integer >=0) MAXObs(numlist max=1 integer >=0) ///
+        MINPeriods(numlist max=1 integer >=0) MAXPeriods(numlist max=1 integer >=0) ///
+        MINMobility(numlist max=1 integer >=0) MAXMobility(numlist max=1 integer >=0) ///
         MOVers(numlist max=1 >=0) STAYers(numlist max=1 >=0) ///
+        MOBSTRata ///
         ANY ALL GROUPRule(string) ///
-        CONNected ///
+        CONNECTIVity CONNected RECONnect RECONTarget(numlist max=1 >=0 <=100) ///
+        RECONRule(string) ///
         GENerate(name) KEEP(name) REPLACE ///
         SEED(string) ///
         NUMThreads(integer 0) ///
@@ -38,6 +42,11 @@ program define xsamplefe, rclass byable(onecall)
             exit 190
         }
         local by `_byvars'
+    }
+
+    // an empty numlist limit means "no bound"; -1 is the internal sentinel
+    foreach lim in minobs maxobs minperiods maxperiods minmobility maxmobility {
+        if ("``lim''" == "") local `lim' -1
     }
 
     // ---- # : percent (default) or count ------------------------------------
@@ -57,6 +66,10 @@ program define xsamplefe, rclass byable(onecall)
             exit 198
         }
     }
+    if (_N >= 2147483647) {
+        di as err "xsamplefe: datasets with 2,147,483,647 or more observations are not supported by the plugin"
+        exit 198
+    }
     if (`numthreads' < 0) {
         di as err "numthreads() must be >= 0"
         exit 198
@@ -65,12 +78,31 @@ program define xsamplefe, rclass byable(onecall)
         di as err "options any and all may not be combined"
         exit 198
     }
+
+    // ---- generate()/keep(): reserved names, exact match, no data loss -------
     if ("`generate'" != "" & "`keep'" != "") {
         di as err "specify either generate() or keep(), not both"
         exit 198
     }
     if ("`keep'" != "") local generate `keep'
-    if ("`generate'" != "" & "`replace'" == "") confirm new variable `generate'
+    local gen_exists 0
+    if ("`generate'" != "") {
+        capture confirm name `generate'
+        if (_rc | inlist("`generate'", "_all", "_se", "_cons", "_skip")) {
+            di as err "`generate' is not a valid new variable name"
+            exit 198
+        }
+        capture confirm variable `generate', exact
+        local gen_exists = (_rc == 0)
+        if (`gen_exists' & "`replace'" == "") {
+            di as err "variable `generate' already defined"
+            exit 110
+        }
+    }
+    else if ("`replace'" != "") {
+        di as txt "note: option replace has no effect without generate() or keep()"
+    }
+
     if ("`i'" != "") {
         if ("`individual'" != "") {
             di as err "specify either i() or individual(), not both"
@@ -94,64 +126,96 @@ program define xsamplefe, rclass byable(onecall)
         }
     }
     else local grouprule any
-    if ("`movers'" != "" | "`stayers'" != "") {
-        foreach r in movers stayers {
-            if ("``r''" == "") continue
-            if (!`is_count' & ``r'' > 100) {
-                di as err "`r'() must be a percentage between 0 and 100"
-                exit 198
-            }
-            if (`is_count' & ``r'' != int(``r'')) {
-                di as err "`r'() must be an integer count when option count is specified"
-                exit 198
-            }
+    foreach r in movers stayers {
+        if ("``r''" == "") continue
+        if (!`is_count' & ``r'' > 100) {
+            di as err "`r'() must be a percentage between 0 and 100"
+            exit 198
+        }
+        if (`is_count' & (``r'' != int(``r'') | ``r'' > 2147483647)) {
+            di as err "`r'() must be an integer between 0 and 2,147,483,647 when option count is specified"
+            exit 198
         }
     }
+    if ("`recontarget'" != "" | "`reconrule'" != "") local reconnect reconnect
+    if ("`reconrule'" != "") {
+        local reconrule = lower(strtrim("`reconrule'"))
+        if (!inlist("`reconrule'", "gain", "key")) {
+            di as err "reconrule() must be gain or key"
+            exit 198
+        }
+    }
+    else local reconrule gain
 
     // ---- absorb(): reghdfe-style absvars -> plain sampling dimensions -------
+    // Terms are split at blanks outside parentheses, so c.(x z) stays together;
+    // parenthesised groups and c. parts are continuous slopes and are ignored.
     local absvars
     local absvars_display
     if (`"`absorb'"' != "") {
-        local absorb_raw = strtrim(`"`absorb'"')
+        local absorb_raw = strtrim(subinstr(`"`absorb'"', char(9), " ", .))
         gettoken absorb_raw absorb_opts : absorb_raw, parse(",")
-        foreach tok of local absorb_raw {
-            local tok `tok'
+        local nterm 0
+        local depth 0
+        local cur
+        forvalues j = 1/`=length("`absorb_raw'")' {
+            local ch = substr("`absorb_raw'", `j', 1)
+            if ("`ch'" == "(") local ++depth
+            if ("`ch'" == ")") local --depth
+            if ("`ch'" == " " & `depth' == 0) {
+                if ("`cur'" != "") {
+                    local ++nterm
+                    local term`nterm' `cur'
+                }
+                local cur
+            }
+            else local cur `cur'`ch'
+        }
+        if ("`cur'" != "") {
+            local ++nterm
+            local term`nterm' `cur'
+        }
+        forvalues t = 1/`nterm' {
+            local tok `term`t''
             if (strpos("`tok'", "=")) {
                 gettoken lhs tok : tok, parse("=")
                 local tok = subinstr("`tok'", "=", "", 1)
             }
+            while (strpos("`tok'", "(")) {
+                local p = strpos("`tok'", "(")
+                local q = strpos("`tok'", ")")
+                if (`q' < `p') {
+                    di as err "absorb(): unbalanced parentheses in `term`t''"
+                    exit 198
+                }
+                local tok = substr("`tok'", 1, `p' - 1) + substr("`tok'", `q' + 1, .)
+            }
             local tok = subinstr("`tok'", "i.", "", .)
-            if (strpos("`tok'", "#")) {
-                local tok = subinstr("`tok'", "##", "#", .)
-                local parts = subinstr("`tok'", "#", " ", .)
-                local fevars
-                foreach p of local parts {
-                    if (substr("`p'", 1, 2) == "c.") continue
-                    confirm variable `p'
-                    local fevars `fevars' `p'
-                }
-                if ("`fevars'" == "") continue
-                local nfev : word count `fevars'
-                if (`nfev' == 1) {
-                    local absvars `absvars' `fevars'
-                    local absvars_display `absvars_display' `fevars'
-                }
-                else {
-                    tempvar iv
-                    quietly egen long `iv' = group(`fevars')
-                    local absvars `absvars' `iv'
-                    local absvars_display `absvars_display' `tok'
-                }
+            local tok = subinstr("`tok'", "##", "#", .)
+            local parts = subinstr("`tok'", "#", " ", .)
+            local fevars
+            foreach p of local parts {
+                if (substr("`p'", 1, 2) == "c.") continue
+                unab p : `p'
+                local fevars `fevars' `p'
+            }
+            local nfev : word count `fevars'
+            if (`nfev' == 0) continue
+            if (`nfev' == 1) {
+                local absvars `absvars' `fevars'
+                local absvars_display `absvars_display' `fevars'
             }
             else {
-                confirm variable `tok'
-                local absvars `absvars' `tok'
-                local absvars_display `absvars_display' `tok'
+                tempvar iv
+                quietly egen long `iv' = group(`fevars')
+                local absvars `absvars' `iv'
+                local dsp : subinstr local fevars " " "#", all
+                local absvars_display `absvars_display' `dsp'
             }
         }
     }
 
-    // ---- sampling unit, inseparable block, mobility and time dimensions ----
+    // ---- sampling unit and inseparable block --------------------------------
     local unit_display
     if ("`unit'" != "") {
         local unit_display `unit'
@@ -170,6 +234,23 @@ program define xsamplefe, rclass byable(onecall)
     if ("`group'" != "" & "`group'" != "`unit'") local block `group'
     local has_block = ("`block'" != "")
 
+    // ---- time (resolved before the mobility default) ------------------------
+    local need_time = ("`balanced'" != "" | `minperiods' >= 0 | `maxperiods' >= 0)
+    if ("`time'" == "" & `need_time') {
+        capture quietly xtset
+        if (!_rc) local time `r(timevar)'
+        if ("`time'" == "") {
+            di as err "balanced, minperiods() and maxperiods() require time() or an xtset time variable"
+            exit 198
+        }
+    }
+    if ("`time'" != "" & !`has_unit') {
+        di as err "time() requires a sampling unit: specify unit(), absorb() or group()"
+        exit 198
+    }
+    local has_time = ("`time'" != "")
+
+    // ---- mobility dimension (never the time variable) -----------------------
     if ("`mobility'" == "" & `has_unit') {
         if ("`group'" != "" & "`individual'" != "") {
             if ("`unit'" == "`group'") local mobility `individual'
@@ -198,25 +279,20 @@ program define xsamplefe, rclass byable(onecall)
     }
     local has_mob = ("`mobility'" != "")
     if (!`has_mob' & (`minmobility' >= 0 | `maxmobility' >= 0 | "`movers'" != "" | ///
-                       "`stayers'" != "" | "`connected'" != "")) {
-        di as err "{p 0 4}minmobility(), maxmobility(), movers(), stayers() and connected require a mobility dimension: specify mobility(), a second absorb() variable, or group() with individual(){p_end}"
+                       "`stayers'" != "" | "`connected'" != "" | "`reconnect'" != "" | ///
+                       "`mobstrata'" != "" | "`connectivity'" != "")) {
+        di as err "{p 0 4}minmobility(), maxmobility(), movers(), stayers(), mobstrata, connectivity, connected and reconnect require a mobility dimension: specify mobility(), a second absorb() variable, or group() with individual(){p_end}"
         exit 198
     }
-
-    local need_time = ("`balanced'" != "" | `minperiods' >= 0 | `maxperiods' >= 0)
-    if ("`time'" == "" & `need_time') {
-        capture quietly xtset
-        if (!_rc) local time `r(timevar)'
-        if ("`time'" == "") {
-            di as err "balanced, minperiods() and maxperiods() require time() or an xtset time variable"
-            exit 198
-        }
-    }
-    if ("`time'" != "" & !`has_unit') {
-        di as err "time() requires a sampling unit: specify unit(), absorb() or group()"
+    if ("`reconnect'" != "" & `has_block') {
+        di as err "{p 0 4}reconnect may not be combined with a group() closure (group() different from the sampling unit): groups are indivisible and reconnect adds whole units{p_end}"
         exit 198
     }
-    local has_time = ("`time'" != "")
+    local recon_target -1
+    if ("`recontarget'" != "") local recon_target `recontarget'
+    // the connectivity diagnostics cost a union-find over the frame rows: they
+    // are computed only when asked for, or when an option needs them
+    local has_diag = ("`connectivity'`connected'`reconnect'" != "" & `has_mob')
 
     local frame_rule strict
     if ("`any'`all'" != "") {
@@ -254,13 +330,13 @@ program define xsamplefe, rclass byable(onecall)
     markout `touse' `unit_use' `block_use'
     quietly count if `touse'
     local N_frame = r(N)
-    if (`N_frame' == 0) exit
 
     // ---- uniform keys: same draws (order and count) as sample ---------------
     local rngstate = c(rngstate)
     if ("`seed'" != "") set seed `seed'
     local draw 1
-    if ("`movers'" == "" & "`stayers'" == "") {
+    if (`N_frame' == 0) local draw 0
+    else if ("`movers'" == "" & "`stayers'" == "") {
         if (!`is_count' & `exp' == 100) local draw 0
         if (`is_count' & `exp' >= _N) local draw 0
     }
@@ -269,20 +345,30 @@ program define xsamplefe, rclass byable(onecall)
     if (`draw') {
         if (!`is_count') local nobs = int(`N_frame' * (`exp') / 100 + .5)
         else local nobs = `exp'
-        local d1 32
-        if ("`c(rng_current)'" == "mt64") local d1 52
-        local d = log(-log1m(`pduplicates'))
-        local d = ceil((2 * log(`nobs') - `d') / log(2) - 1)
-        local d = ceil(`d' / `d1')
-        local nu = max(2, `d')
+        local utype double
+        if (!`has_unit' & c(userversion) < 14 & _N < 2^31) {
+            // sample uses two float columns under user version < 14
+            local nu 2
+            local utype float
+        }
+        else {
+            local d1 32
+            if ("`c(rng_current)'" == "mt64") local d1 52
+            local d = log(-log1m(`pduplicates'))
+            local d = ceil((2 * log(`nobs') - `d') / log(2) - 1)
+            local d = ceil(`d' / `d1')
+            local nu = max(2, `d')
+        }
         forvalues c = 1/`nu' {
             tempvar u`c'
-            quietly gen double `u`c'' = runiform()
+            quietly gen `utype' `u`c'' = runiform()
             local ulist `ulist' `u`c''
         }
     }
 
     // ---- plugin configuration ------------------------------------------------
+    tempname pfx
+    local sp `pfx'_
     local cfg "cfg=is_count=`is_count';"
     if (`is_count') local cfg "`cfg'count=`exp';"
     else local cfg "`cfg'pct=`exp';"
@@ -293,8 +379,10 @@ program define xsamplefe, rclass byable(onecall)
     local cfg "`cfg'minmob=`minmobility';maxmob=`maxmobility';"
     if ("`movers'" != "") local cfg "`cfg'rate_movers=`movers';"
     if ("`stayers'" != "") local cfg "`cfg'rate_stayers=`stayers';"
+    local cfg "`cfg'mobstrata=`=("`mobstrata'" != "")';connectivity=`=("`connectivity'" != "")';"
+    local cfg "`cfg'reconnect=`=("`reconnect'" != "")';recon_target=`recon_target';recon_rule=`reconrule';"
     local cfg "`cfg'connected=`=("`connected'" != "")';num_threads=`numthreads';"
-    local cfg "`cfg'verbose=`=("`verbose'" != "")';s_prefix=__xsf_;"
+    local cfg "`cfg'verbose=`=("`verbose'" != "")';s_prefix=`sp';"
 
     tempvar out
     quietly gen byte `out' = .
@@ -330,22 +418,38 @@ program define xsamplefe, rclass byable(onecall)
     capture noisily plugin call `plugin_prog' `touse' `unit_use' `by_use' `time_use' ///
         `mobility_use' `block_use' `ulist' `out', "`cfg'"
     local rc = _rc
-    if (`rc') exit `rc'
 
     local scalars N_total N_frame N_outside N_ineligible N_frame_retained N_retained ///
         N_connected_dropped n_components U_frame U_eligible U_ineligible U_selected ///
         U_retained U_movers_eligible U_movers_selected U_movers_retained U_split ///
-        K_target S_by S_final T_periods M_frame M_retained G_frame G_kept G_retained ///
+        U_partial U_inelig_ret K_target S_by S_final T_periods M_frame M_retained ///
+        G_frame G_kept G_retained C_frame LCC_frame_share C_sample LCC_share ///
+        LCC_units_share LCC_mob_share U_lcc_kept U_reconnected N_reconnected ///
         threads_requested threads_effective threads_used openmp_enabled thread_capacity
+    if (`rc') {
+        foreach s of local scalars {
+            capture scalar drop `sp'`s'
+        }
+        exit `rc'
+    }
     foreach s of local scalars {
-        local `s' = scalar(__xsf_`s')
-        capture scalar drop __xsf_`s'
+        local `s' = scalar(`sp'`s')
+        capture scalar drop `sp'`s'
+    }
+    // with group() equal to the sampling unit there is no closure to apply, but
+    // the group counts are the unit counts and are reported all the same
+    if ("`group'" != "" & !`has_block') {
+        local G_frame = `U_frame'
+        local G_kept = `U_selected'
+        local G_retained = `U_retained'
     }
 
     // ---- apply ----------------------------------------------------------------
     if ("`generate'" != "") {
-        capture drop `generate'
-        quietly gen byte `generate' = `out'
+        tempvar gflag
+        quietly gen byte `gflag' = `out'
+        if (`gen_exists') drop `generate'
+        rename `gflag' `generate'
         label variable `generate' "xsamplefe: 1 = retained in sample"
     }
     else {
@@ -371,15 +475,20 @@ program define xsamplefe, rclass byable(onecall)
         as txt "  retained " as res %12.0fc `N_frame_retained' ///
         as txt "  outside if/in " as res %10.0fc `N_outside' ///
         as txt "  ineligible " as res %10.0fc `N_ineligible'
-    if (`nby' > 0) {
-        di as txt "  strata by(" as res "`by'" as txt "): " as res %8.0fc `S_by' ///
-            as txt cond(`S_final' != `S_by', "  (final strata incl. mover class: " + string(`S_final', "%8.0fc") + ")", "")
+    if (`nby' > 0 | "`mobstrata'" != "") {
+        local strata_lbl "by(`by')"
+        if ("`mobstrata'" != "") local strata_lbl "`strata_lbl' x mobility class"
+        di as txt "  strata " as res "`strata_lbl'" as txt ": " as res %8.0fc `S_by' ///
+            as txt cond(`S_final' != `S_by', "  (final strata: " + string(`S_final', "%8.0fc") + ")", "")
     }
     if (`has_time') {
         di as txt "  time (" as res "`time'" as txt "): " as res %6.0fc `T_periods' as txt " periods" ///
             as txt cond("`balanced'" != "", "; balanced units only", "") ///
             as txt cond(`minperiods' >= 0, "; min periods " + string(`minperiods'), "") ///
             as txt cond(`maxperiods' >= 0, "; max periods " + string(`maxperiods'), "")
+        if ("`balanced'" != "" & `T_periods' == 0) {
+            di as txt "note: no unit is eligible: the frame has no non-missing `time' value"
+        }
     }
     if (`has_mob') {
         di as txt "  mobility (" as res "`mobility_display'" as txt "): movers eligible " ///
@@ -388,9 +497,19 @@ program define xsamplefe, rclass byable(onecall)
         di as txt "                 values covered " as res %12.0fc `M_retained' ///
             as txt " of " as res %12.0fc `M_frame'
     }
+    if (`has_diag') {
+        di as txt "  connectivity: frame " as res %8.0fc `C_frame' as txt " component(s), largest " ///
+            as res %5.1f 100 * `LCC_frame_share' as txt "% of rows; sample " as res %8.0fc `C_sample' ///
+            as txt " component(s), largest " as res %5.1f 100 * `LCC_share' as txt "% of rows"
+    }
     if (`has_block') {
         di as txt "  group closure (" as res "`block'" as txt ", `grouprule'): groups kept " ///
             as res %12.0fc `G_kept' as txt " of " as res %12.0fc `G_frame'
+    }
+    if ("`reconnect'" != "") {
+        di as txt "  reconnect (" as res "`reconrule'" as txt "): " as res %12.0fc `U_reconnected' as txt " unit(s) added (" ///
+            as res %12.0fc `N_reconnected' as txt " observations) to reach a largest component of " ///
+            as res %5.1f 100 * `LCC_share' as txt "% of the sample rows"
     }
     if ("`connected'" != "") {
         di as txt "  connected set: " as res %6.0fc `n_components' as txt " component(s); " ///
@@ -418,6 +537,8 @@ program define xsamplefe, rclass byable(onecall)
     return scalar N_units_ineligible = `U_ineligible'
     return scalar N_units_sampled = `U_selected'
     return scalar N_units_retained = `U_retained'
+    return scalar N_units_partial = `U_partial'
+    return scalar N_units_ineligible_retained = `U_inelig_ret'
     return scalar N_movers_eligible = `U_movers_eligible'
     return scalar N_movers_sampled = `U_movers_selected'
     return scalar N_movers_retained = `U_movers_retained'
@@ -431,6 +552,15 @@ program define xsamplefe, rclass byable(onecall)
     return scalar N_groups = `G_frame'
     return scalar N_groups_kept = `G_kept'
     return scalar N_groups_retained = `G_retained'
+    return scalar N_components_frame = `C_frame'
+    return scalar lcc_share_frame = `LCC_frame_share'
+    return scalar N_components = `C_sample'
+    return scalar lcc_share = `LCC_share'
+    return scalar lcc_units_share = `LCC_units_share'
+    return scalar lcc_mobility_share = `LCC_mob_share'
+    return scalar N_units_lcc_kept = `U_lcc_kept'
+    return scalar N_units_reconnected = `U_reconnected'
+    return scalar N_reconnected = `N_reconnected'
     return scalar threads_requested = `threads_requested'
     return scalar threads_effective = `threads_effective'
     return scalar threads_used = `threads_used'
@@ -442,6 +572,7 @@ program define xsamplefe, rclass byable(onecall)
     return local rngstate `"`rngstate'"'
     return local frame_rule "`frame_rule'"
     return local grouprule "`grouprule'"
+    return local reconrule "`reconrule'"
     return local generate "`generate'"
     return local by "`by'"
     return local time "`time'"

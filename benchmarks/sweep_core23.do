@@ -29,8 +29,8 @@ file open R using "`OUT'", write text replace
 file write R "dataset,N,fes,units,units_sampled,N_unit_sample,t_unit16,t_unit1,det_ok,integrity_ok,t_unit2,t_movers,components,t_obs,t_sample,parity_ok,t_balanced,xhdfe_N,xhdfe_conv,xhdfe_t,reghdfe_N,reghdfe_t,max_b_diff" _n
 file close R
 
-capture program drop xsf_sweep
-program define xsf_sweep
+capture program drop xsf_sweep_body
+program define xsf_sweep_body
     args name fes y xs clvar timevar do_reghdfe
     di as result _n "===================== `name' ====================="
     local N = _N
@@ -146,34 +146,66 @@ program define xsf_sweep
 end
 global SWEEP_OUT "`OUT'"
 
+* every case writes a row: on failure the dataset name and the rc are recorded
+capture program drop xsf_fail
+program define xsf_fail
+    args name rc
+    di as error "SWEEP `name': FAILED rc=`rc'"
+    file open R using "$SWEEP_OUT", write text append
+    file write R "`name',ERROR,rc=`rc'" _n
+    file close R
+end
+
+capture program drop xsf_sweep
+program define xsf_sweep
+    local name : word 1 of `0'
+    capture noisily xsf_sweep_body `0'
+    if (_rc) xsf_fail `name' `=_rc'
+end
+
 * small fixtures first
-use "`XHDFE_ROOT'/stata/example/data/felsdvsimul.dta", clear
-describe, short
-capture noisily xsf_sweep felsdvsimul "i j" y "x1 x2" i "" 1
-do "`XHDFE_ROOT'/tests/stata/fixtures/toy-patents-chain.do"
-toy_dificil 128 2
-capture noisily xsf_sweep toy_patents_chain "inventor_id year" citations "funding lab_size" inventor_id year 1
+capture noisily use "`XHDFE_ROOT'/stata/example/data/felsdvsimul.dta", clear
+if (_rc) xsf_fail felsdvsimul `=_rc'
+else {
+    describe, short
+    xsf_sweep felsdvsimul "i j" y "x1 x2" i "" 1
+}
+capture noisily do "`XHDFE_ROOT'/tests/stata/fixtures/toy-patents-chain.do"
+if (_rc) xsf_fail toy_patents_chain `=_rc'
+else {
+    toy_dificil 128 2
+    xsf_sweep toy_patents_chain "inventor_id year" citations "funding lab_size" inventor_id year 1
+}
 * Sergio core datasets
 foreach d in credit2 soccer synthetic-zigzag credit directors enron patents synthetic-complete synthetic-uniform-easy synthetic-uniform-hard synthetic-uniform-harder {
-    use "`SERGIO'/`d'.dta", clear
-    capture noisily xsf_sweep `d' "id1 id2" y "x1 x2" id1 "" 1
+    capture noisily use "`SERGIO'/`d'.dta", clear
+    if (_rc) xsf_fail `d' `=_rc'
+    else xsf_sweep `d' "id1 id2" y "x1 x2" id1 "" 1
 }
-use "`SERGIO'/synthetic-assortative.dta", clear
-capture noisily xsf_sweep synthetic-assortative "id1 id2 year" y "x1 x2" id1 year 1
-use "`SERGIO'/github.dta", clear
-capture noisily xsf_sweep github "id1 id2 id3" y "x1 x2" id1 "" 1
-use "`SERGIO'/schools.dta", clear
-capture noisily xsf_sweep schools "id1 id2 id3" y "x1 x2" id1 "" 1
-use "`SERGIO'/workers.dta", clear
-capture noisily xsf_sweep workers "id1 id2 id3 id4" y "x1 x2" id1 "" 1
+capture noisily use "`SERGIO'/synthetic-assortative.dta", clear
+if (_rc) xsf_fail synthetic-assortative `=_rc'
+else xsf_sweep synthetic-assortative "id1 id2 year" y "x1 x2" id1 year 1
+capture noisily use "`SERGIO'/github.dta", clear
+if (_rc) xsf_fail github `=_rc'
+else xsf_sweep github "id1 id2 id3" y "x1 x2" id1 "" 1
+capture noisily use "`SERGIO'/schools.dta", clear
+if (_rc) xsf_fail schools `=_rc'
+else xsf_sweep schools "id1 id2 id3" y "x1 x2" id1 "" 1
+capture noisily use "`SERGIO'/workers.dta", clear
+if (_rc) xsf_fail workers `=_rc'
+else xsf_sweep workers "id1 id2 id3 id4" y "x1 x2" id1 "" 1
 * pyfixest DGP 1M and 10M
-pq use using "`PF'/benchmark_difficult_n1000000_k10.parquet", clear
-capture noisily xsf_sweep pf_difficult_1m "indiv_id firm_id year" y "x1 x2 x3 x4 x5 x6 x7 x8 x9 x10" indiv_id year 1
-pq use using "`PF'/benchmark_simple_n10000000_k10.parquet", clear
-capture noisily xsf_sweep pf_simple_10m "indiv_id firm_id year" y "x1 x2 x3 x4 x5 x6 x7 x8 x9 x10" indiv_id year 0
-pq use using "`PF'/benchmark_difficult_n10000000_k10.parquet", clear
-capture noisily xsf_sweep pf_difficult_10m "indiv_id firm_id year" y "x1 x2 x3 x4 x5 x6 x7 x8 x9 x10" indiv_id year 0
+capture noisily pq use using "`PF'/benchmark_difficult_n1000000_k10.parquet", clear
+if (_rc) xsf_fail pf_difficult_1m `=_rc'
+else xsf_sweep pf_difficult_1m "indiv_id firm_id year" y "x1 x2 x3 x4 x5 x6 x7 x8 x9 x10" indiv_id year 1
+capture noisily pq use using "`PF'/benchmark_simple_n10000000_k10.parquet", clear
+if (_rc) xsf_fail pf_simple_10m `=_rc'
+else xsf_sweep pf_simple_10m "indiv_id firm_id year" y "x1 x2 x3 x4 x5 x6 x7 x8 x9 x10" indiv_id year 0
+capture noisily pq use using "`PF'/benchmark_difficult_n10000000_k10.parquet", clear
+if (_rc) xsf_fail pf_difficult_10m `=_rc'
+else xsf_sweep pf_difficult_10m "indiv_id firm_id year" y "x1 x2 x3 x4 x5 x6 x7 x8 x9 x10" indiv_id year 0
 * main_95_21_ready (47.6M, proprietary, local)
-pq use using "`READY'", clear
-capture noisily xsf_sweep main_95_21_ready "w_id f_id year" log_rhwage "age_sq tenure tenure_sq educ" w_id year 1
+capture noisily pq use using "`READY'", clear
+if (_rc) xsf_fail main_95_21_ready `=_rc'
+else xsf_sweep main_95_21_ready "w_id f_id year" log_rhwage "age_sq tenure tenure_sq educ" w_id year 1
 di as result "SWEEP DONE"

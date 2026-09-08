@@ -1,10 +1,10 @@
 v 3
-d xsamplefe: random samples of panel / fixed-effect data for reghdfe and xhdfe
+d xsamplefe 1.1.0: random samples of panel / fixed-effect data for reghdfe and xhdfe
 d
 d Draws whole-unit random samples aligned with reghdfe's absorb(), group() and
 d individual(); reproduces sample and sample2 for the simple cases; strata,
-d balanced panels, mobility structure and connected sets. C++/OpenMP plugin
-d without external dependencies.
+d balanced panels, mobility structure, connectivity diagnostics, connected sets
+d and reconnect. C++/OpenMP plugin without external dependencies.
 d If the bundled plugin is not compatible with your platform, build it with:
 d   `bash stata/tools/build-xsamplefe-plugin.sh`
 f xsamplefe.ado

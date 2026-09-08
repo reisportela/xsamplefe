@@ -3,6 +3,14 @@
 #   STATA_BIN=stata-mp                 Stata executable (default: stata-mp, then stata-se, stata)
 #   XSAMPLEFE_BUILD_PLUGIN=1           rebuild stata/xsamplefe.plugin first
 #   XSAMPLEFE_BUILD_ARGS="--linux --openmp"
+#   XHDFE_ADOPATH=/path/to/xhdfe/stata  optional: enables the reghdfe/xhdfe comparison
+#                                      (default: a sibling xhdfe checkout, if present)
+#   XSAMPLEFE_SELFTEST=1              inject tests/xsamplefe_selftest_fail.do (one
+#                                      deliberately false assert) before the real
+#                                      certification files; the run must then fail.
+#                                      Used by tests/selftest.sh, which checks that
+#                                      this script reports a failing certification.
+# Requires reghdfe and sample2 (net install dm46, from(http://www.stata.com/stb/stb37)).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,6 +35,10 @@ fi
 
 export XSAMPLEFE_TEST_DIR="${SCRIPT_DIR}"
 export XSAMPLEFE_ADOPATH="${XSAMPLEFE_ADOPATH:-${REPO_ROOT}/stata}"
+if [[ -z "${XHDFE_ADOPATH:-}" && -f "${REPO_ROOT}/../xhdfe/stata/xhdfe.ado" ]]; then
+  XHDFE_ADOPATH="$(cd -- "${REPO_ROOT}/../xhdfe/stata" && pwd)"
+fi
+export XHDFE_ADOPATH="${XHDFE_ADOPATH:-}"
 
 OUT_DIR="${SCRIPT_DIR}/output"
 mkdir -p "${OUT_DIR}"

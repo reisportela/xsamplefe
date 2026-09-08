@@ -48,12 +48,22 @@ Usage: build-xsamplefe-plugin.sh [--windows|--linux] [--openmp|--no-openmp] [--m
 Builds the Stata plugin `xsamplefe.plugin` next to xsamplefe.ado.
 
 Targets:
-  --windows    Build a Windows (PE/DLL) plugin using mingw-w64 (static GNU runtimes).
-  --linux      Build a Linux/macOS (ELF/Mach-O) plugin using the native toolchain.
+  --windows    Build a Windows (PE/DLL) plugin using mingw-w64 (static GNU runtimes):
+               cross build from Linux/WSL (apt-get install g++-mingw-w64-x86-64) or
+               native build in an MSYS2 MINGW64 shell (pacman -S mingw-w64-x86_64-gcc).
+  --linux      Build a Linux/macOS (ELF/Mach-O) plugin using the native toolchain
+               (default when no target is given; macOS gives a universal binary).
 
 OpenMP:
-  --openmp     Enable OpenMP (default on Linux; production builds must use it).
-  --no-openmp  Disable OpenMP (diagnostic builds only).
+  --openmp     Enable OpenMP (default on Linux and Windows; production builds must
+               use it). On macOS it needs Homebrew libomp (brew install libomp) and
+               builds for the host architecture only.
+  --no-openmp  Disable OpenMP (default on macOS; diagnostic builds elsewhere).
+
+Environment:
+  XHDFE_STATIC_GNU_LIBS=1   Linux: embed libstdc++/libgcc (portable binary; libgomp
+                            and glibc stay dynamic).
+  LIBOMP_PREFIX=/path       macOS: libomp prefix when brew is not on PATH.
 
 CPU tuning:
   --march-native   Tune for the build host (opt-in; not for redistribution).
@@ -93,8 +103,16 @@ if [[ "${UNAME_S}" == "Darwin" ]]; then
 fi
 
 if [[ "${TARGET}" == "windows" ]]; then
-  CXX="${CXX:-x86_64-w64-mingw32-g++}"
-  STRIP_BIN="${STRIP_BIN:-x86_64-w64-mingw32-strip}"
+  # Cross build (Linux/WSL) uses the mingw-w64 triplet; a native MSYS2 MINGW64
+  # shell has plain g++ (and usually the triplet too).
+  if [[ -z "${CXX:-}" ]]; then
+    if command -v x86_64-w64-mingw32-g++ >/dev/null 2>&1; then CXX="x86_64-w64-mingw32-g++"
+    elif [[ "${UNAME_S}" == MINGW* || "${UNAME_S}" == MSYS* ]]; then CXX="g++"
+    else CXX="x86_64-w64-mingw32-g++"; fi
+  fi
+  if [[ -z "${STRIP_BIN:-}" ]]; then
+    if command -v x86_64-w64-mingw32-strip >/dev/null 2>&1; then STRIP_BIN="x86_64-w64-mingw32-strip"; else STRIP_BIN="strip"; fi
+  fi
   SYSTEM_DEF="STWIN32"
   if [[ -z "${OPENMP_MODE}" ]]; then OPENMP_MODE="on"; fi
 else
@@ -109,8 +127,23 @@ if ! command -v "${CXX}" >/dev/null 2>&1; then
   echo "Error: compiler not found: ${CXX}" >&2
   if [[ "${TARGET}" == "windows" ]]; then
     echo "Install mingw-w64 (Ubuntu/Debian): apt-get install -y g++-mingw-w64-x86-64" >&2
+    echo "On Windows: MSYS2 MINGW64 shell with pacman -S mingw-w64-x86_64-gcc" >&2
+  elif [[ "${UNAME_S}" == "Darwin" ]]; then
+    echo "Install the Xcode command line tools: xcode-select --install" >&2
   fi
   exit 1
+fi
+
+# macOS: Apple clang has no OpenMP runtime; --openmp uses Homebrew's libomp
+# (brew install libomp) and then builds for the host architecture only, since
+# the universal (x86_64 + arm64) binary cannot link a single-arch libomp.
+OMP_PREFIX=""
+if [[ "${UNAME_S}" == "Darwin" && "${TARGET}" != "windows" && "${OPENMP_MODE}" == "on" ]]; then
+  OMP_PREFIX="${LIBOMP_PREFIX:-$(brew --prefix libomp 2>/dev/null || true)}"
+  if [[ -z "${OMP_PREFIX}" || ! -f "${OMP_PREFIX}/include/omp.h" ]]; then
+    echo "Error: --openmp on macOS needs Homebrew libomp (brew install libomp), or set LIBOMP_PREFIX." >&2
+    exit 1
+  fi
 fi
 
 if [[ -z "${MARCH_NATIVE_MODE}" ]]; then MARCH_NATIVE_MODE="off"; fi
@@ -136,8 +169,13 @@ if [[ "${MARCH_NATIVE_MODE}" == "on" && "${TARGET}" != "windows" && "${UNAME_S}"
   compile_flags+=( -march=native -mtune=native )
 fi
 if [[ "${OPENMP_MODE}" == "on" ]]; then
-  compile_flags+=( -fopenmp )
-  link_flags+=( -fopenmp )
+  if [[ -n "${OMP_PREFIX}" ]]; then
+    compile_flags+=( -Xpreprocessor -fopenmp -I"${OMP_PREFIX}/include" )
+    link_flags+=( -L"${OMP_PREFIX}/lib" -lomp )
+  else
+    compile_flags+=( -fopenmp )
+    link_flags+=( -fopenmp )
+  fi
 fi
 if [[ "${TARGET}" != "windows" && "${UNAME_S}" == "Linux" && "${XHDFE_STATIC_GNU_LIBS:-}" =~ ^(1|ON|on|true|yes)$ ]]; then
   link_flags+=( -static-libstdc++ -static-libgcc )
@@ -152,8 +190,11 @@ compile_plugin() {
     -x c++ "${STPLUGIN_C}" -x none "${SRC}" -o "${out}"
 }
 
-if [[ "${UNAME_S}" == "Darwin" && "${TARGET}" != "windows" ]]; then
-  echo "Building ${OUT_PLUGIN} (universal: x86_64 + arm64)"
+if [[ "${UNAME_S}" == "Darwin" && "${TARGET}" != "windows" && -n "${OMP_PREFIX}" ]]; then
+  echo "Building ${OUT_PLUGIN} (macOS $(uname -m), OpenMP via ${OMP_PREFIX})"
+  compile_plugin "${OUT_PLUGIN}"
+elif [[ "${UNAME_S}" == "Darwin" && "${TARGET}" != "windows" ]]; then
+  echo "Building ${OUT_PLUGIN} (universal: x86_64 + arm64, OpenMP off)"
   tmp_x86="${BUILD_DIR}/xsamplefe.plugin.x86_64"
   tmp_arm="${BUILD_DIR}/xsamplefe.plugin.arm64"
   compile_plugin "${tmp_x86}" -target x86_64-apple-macos10.12
