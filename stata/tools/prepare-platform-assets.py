@@ -63,7 +63,9 @@ def collect(platform, out):
         text = "GNU and MinGW-w64 runtime notices from the native build toolchain.\n\n"
         for path in sorted(licenses):
             text += f"\n===== {path.relative_to(license_root)} =====\n" + path.read_text(errors="replace")
-        (out / "xsamplefe_win64_runtime_license.txt").write_text(text)
+        # Canonical text also stays byte-identical after a Unix net install.
+        with (out / "xsamplefe_win64_runtime_license.txt").open("w", encoding="utf-8", newline="\n") as license_file:
+            license_file.write(text)
     (out / f"{platform}_build.json").write_text(json.dumps(receipt, indent=2) + "\n")
 
 
