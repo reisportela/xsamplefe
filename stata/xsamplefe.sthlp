@@ -1,5 +1,5 @@
 {smcl}
-{* *! version 1.2.3  09sep2026}{...}
+{* *! version 1.3.0  24sep2026}{...}
 {vieweralsosee "[D] sample" "help sample"}{...}
 {vieweralsosee "[R] bsample" "help bsample"}{...}
 {vieweralsosee "" "--"}{...}
@@ -350,8 +350,9 @@ nor {cmd:xsamplefe} is reproducible under that prefix unless the data were
 already sorted ({cmd:sort, stable}) or {opt by()} is used instead.
 
 {pstd}
-{cmd:xsamplefe} leaves the data in the order it found them (the internal steps
-use {help sortpreserve:sortpreserve}, and the plugin never reorders rows). For
+{cmd:xsamplefe} leaves the data in the order it found them: it never sorts them
+(the {helpb xtset} time variable is read without sorting, the internal
+{cmd:egen} steps preserve the order, and the plugin never reorders rows). For
 that reason, and unlike {cmd:sample}, {it:in} may be combined with {opt by()}:
 the range refers to the current order of the data and the rows outside it are
 kept.
@@ -416,8 +417,8 @@ the retained units that were in the frame's largest component and are still in
 the sample's largest one. {opt connected} and {opt reconnect} need the same
 graphs and report them too, as does {opt minmovers()}; without any of these
 options the seven graph results are
-missing and no graph is built, because each one costs a serial union-find over
-every frame row.
+missing and no graph is built, because each one costs a pass over the frame
+rows and a union-find over their distinct unit-mobility links.
 
 {pstd}
 This matters because keeping whole units preserves the mobility of each unit
@@ -441,7 +442,10 @@ first, ties broken by the unit's own uniform key and then by its rank;
 {opt reconrule(key)} takes the frontier in the order of that key alone, that is
 in random order. {cmd:r(N_units_reconnected)} and {cmd:r(N_reconnected)} report
 what was added. On the two benchmarks above, {opt reconnect} restores 76.0 and
-69.0 percent by adding 5,334 and 7,116 units under {cmd:gain}.
+69.0 percent by adding 4,442 and 6,131 units under {cmd:gain}. Versions before
+1.3.0 refreshed the frontier only when it ran out, so a unit that touched a
+component just merged into the largest one could be passed over; their
+{opt reconnect} results differ from these.
 
 {pstd}
 {it:The price is size and composition, and it is large.} The gain rule prefers,
@@ -454,10 +458,10 @@ Measured on a 10 percent unit draw ({cmd:absorb(id1 id2)}, {cmd:set seed 1}):
 {p2colset 9 42 44 2}{...}
 {p2col :{it:patents} (500,008 rows, 101,837 units)}{p_end}
 {p2col :  10 percent draw}50,241 rows, 10,184 units, 4.93 mobility values per unit, 92.0 percent movers, largest component 0.8 percent{p_end}
-{p2col :  after {cmd:reconnect}}106,639 rows, 15,518 units, 6.87 per unit, 94.7 percent movers, largest component 76.0 percent{p_end}
+{p2col :  after {cmd:reconnect}}99,315 rows, 14,626 units, 6.79 per unit, 94.4 percent movers, largest component 76.0 percent{p_end}
 {p2col :{it:synthetic-assortative} (499,155 rows)}{p_end}
 {p2col :  10 percent draw}49,446 rows, 12,610 units, 1.55 per unit, 39.9 percent movers, largest component 0.1 percent{p_end}
-{p2col :  after {cmd:reconnect}}101,386 rows, 19,726 units, 1.98 per unit, 60.1 percent movers, largest component 69.0 percent{p_end}
+{p2col :  after {cmd:reconnect}}96,522 rows, 18,741 units, 1.97 per unit, 58.8 percent movers, largest component 69.0 percent{p_end}
 {p2col :{it:enron} (367,662 rows)}{p_end}
 {p2col :  10 percent draw}37,595 rows, 3,669 units, 10.25 per unit, largest component 96.2 percent{p_end}
 {p2col :  after {cmd:reconnect}}63,462 rows, 3,704 units, 17.13 per unit, largest component 98.4 percent{p_end}
@@ -465,7 +469,7 @@ Measured on a 10 percent unit draw ({cmd:absorb(id1 id2)}, {cmd:set seed 1}):
 
 {pstd}
 In other words, a {it:#} percent request can come back at roughly twice
-{it:#} percent of the rows (2.1x on {cmd:patents} and
+{it:#} percent of the rows (2.0x on {cmd:patents} and
 {cmd:synthetic-assortative}, 1.7x on {cmd:enron} with only 35 units added,
 because those 35 are hubs), with a visibly higher mean mobility and mover
 share. The population shares of the mobility classes are {it:not} preserved.
@@ -475,29 +479,30 @@ share. The population shares of the mobility classes are {it:not} preserved.
 {pstd}
 {opt reconrule(key)} trades size for composition. Both rules reach the same
 target; taking the frontier in key order adds more units, and smaller ones, so
-the sample is larger and slower to build but its mean number of mobility values
-per unit is much closer to the population. Same three datasets, same 10 percent
+the sample is larger but its mean number of mobility values per unit is much
+closer to the population. Same three datasets, same 10 percent
 draw and the frame share as the target ({cmd:absorb(id1 id2)},
 {cmd:set seed 1}, 16 threads):
 
 {p2colset 9 32 34 2}{...}
 {p2col :{it:patents} (population 4.910 mobility values per unit, 91.8 percent movers; the 10 percent draw has 50,241 rows, 4.933 and 92.0 percent)}{p_end}
-{p2col :  {cmd:reconrule(gain)}}106,639 rows, 15,518 units (+5,334), 6.872 per unit, 94.7 percent movers, 10.5 s{p_end}
-{p2col :  {cmd:reconrule(key)}}124,331 rows, 22,304 units (+12,120), 5.574 per unit, 95.1 percent movers, 16.0 s{p_end}
+{p2col :  {cmd:reconrule(gain)}}99,315 rows, 14,626 units (+4,442), 6.790 per unit, 94.4 percent movers, 0.2 s{p_end}
+{p2col :  {cmd:reconrule(key)}}123,679 rows, 22,346 units (+12,162), 5.535 per unit, 95.1 percent movers, 0.2 s{p_end}
 {p2col :{it:synthetic-assortative} (population 1.556 and 40.3 percent; draw 49,446 rows, 1.549 and 39.9 percent)}{p_end}
-{p2col :  {cmd:reconrule(gain)}}101,386 rows, 19,726 units (+7,116), 1.981 per unit, 60.1 percent movers, 2.0 s{p_end}
-{p2col :  {cmd:reconrule(key)}}114,629 rows, 26,863 units (+14,253), 1.802 per unit, 54.2 percent movers, 4.1 s{p_end}
+{p2col :  {cmd:reconrule(gain)}}96,522 rows, 18,741 units (+6,131), 1.967 per unit, 58.8 percent movers, 0.2 s{p_end}
+{p2col :  {cmd:reconrule(key)}}114,199 rows, 26,807 units (+14,197), 1.791 per unit, 53.9 percent movers, 0.2 s{p_end}
 {p2col :{it:enron} (population 10.020 and 69.4 percent; draw 37,595 rows, 10.247 and 69.0 percent)}{p_end}
-{p2col :  {cmd:reconrule(gain)}}63,462 rows, 3,704 units (+35), 17.133 per unit, 69.3 percent movers, 0.2 s{p_end}
-{p2col :  {cmd:reconrule(key)}}66,517 rows, 6,241 units (+2,572), 10.658 per unit, 71.1 percent movers, 4.2 s{p_end}
+{p2col :  {cmd:reconrule(gain)}}63,462 rows, 3,704 units (+35), 17.133 per unit, 69.3 percent movers, 0.1 s{p_end}
+{p2col :  {cmd:reconrule(key)}}66,536 rows, 6,246 units (+2,577), 10.653 per unit, 71.1 percent movers, 0.2 s{p_end}
 {p2colreset}{...}
 
 {pstd}
 {cmd:key} wins on the mean number of mobility values per unit on all three
 (most visibly on {cmd:enron}: 10.7 against 17.1, with a population of 10.0) and
 on the mover share of {cmd:synthetic-assortative}; {cmd:gain} wins on size
-(5 to 17 percent fewer rows), on time (up to 20x on {cmd:enron}) and, slightly,
-on the mover share of {cmd:patents} and {cmd:enron}. Because neither dominates,
+(5 to 20 percent fewer rows) and, slightly, on the mover share of {cmd:patents}
+and {cmd:enron}. Both take well under a second on these datasets. Because
+neither dominates,
 {cmd:gain} remains the default; choose {cmd:key} when the composition of the
 sample matters more than its size.
 
@@ -672,7 +677,8 @@ unit-mobility graph on the eligible frame and on the final sample, and the
 movers per {opt mobility()} value on both; see
 {help xsamplefe##connectivity:Connectivity} and
 {help xsamplefe##bias:Limited mobility bias}. It is off by default because each
-graph costs a serial union-find over every frame row; {opt connected} and
+graph costs a pass over the frame rows and a union-find over their distinct
+links; {opt connected} and
 {opt reconnect} build the same graphs and report the components without the
 option, but not the movers per value, which cost one further pass.
 
@@ -712,7 +718,7 @@ the cost.
 adds next: {cmd:gain} (default) the one that joins the most rows to the largest
 component, {cmd:key} the one with the smallest uniform key, that is in random
 order. In the reported benchmarks, {cmd:key} is closer on some composition
-measures and costs more rows and time; this is not a general dominance result.
+measures and costs more rows; this is not a general dominance result.
 See {help xsamplefe##connectivity:Connectivity} for the measured
 trade-off. Ties are broken the same way in both cases (the key, then the unit's
 rank), so both are deterministic and invariant to {opt numthreads()} and to the
@@ -731,7 +737,11 @@ sampling unit is not the group (default {cmd:any}).
 
 {phang}{opt numthreads(#)} requests an OpenMP team of {it:#} threads (capped by
 the logical processors visible to the process); 0 uses the runtime default.
-{cmd:r(threads_used)} reports the largest team actually formed.
+{cmd:r(threads_used)} reports the largest team actually formed. Ranking, the
+per-unit statistics, the draw, the retention rules and the construction of the
+graph links run in parallel; the union-find over the distinct links, the
+{opt reconnect} search and reading and writing the data through Stata's plugin
+interface run on one thread. No result depends on the number of threads.
 
 {phang}{opt verbose} prints the elapsed time of every plugin phase.
 

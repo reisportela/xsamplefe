@@ -126,4 +126,147 @@ xsamplefe 2, count unit(worker) mobility(firm) seed(`chosen') recontarget(95) ge
 assert r(N_movers_eligible) == 0 & r(N_units_reconnected) == 8
 assert abs(r(lcc_share) - .9) < 1e-12
 
+* The xtset time variable is read without sorting: in refers to the caller's
+* order, and the data keep it.
+clear
+set obs 60
+gen long w = ceil(_n / 3)
+gen int t = mod(_n - 1, 3) + 1
+xtset w t
+set seed 99
+gen double sh = runiform()
+sort sh
+gen long order0 = _n
+xsamplefe 50 in 1/30, unit(w) balanced any seed(1) generate(implicit)
+assert order0 == _n
+xsamplefe 50 in 1/30, unit(w) time(t) balanced any seed(1) generate(explicit)
+assert implicit == explicit
+
+* Observation mode with ties on the first keys, against Stata's own sort:
+* the order is (u1, u2, u3, row) within every stratum. The plugin is called
+* directly with constructed keys; a large stratum takes the bucket path.
+quietly findfile xsamplefe.ado
+local xk_plugin = subinstr("`r(fn)'", "xsamplefe.ado", "xsamplefe.plugin", 1)
+capture program drop xcert_plugin
+program xcert_plugin, plugin using("`xk_plugin'")
+capture program drop xcert_keys
+program define xcert_keys
+    args pct nby threads
+    tempvar out ref n k
+    quietly gen byte `out' = 0
+    local byvar = cond(`nby', "s", "")
+    plugin call xcert_plugin touse `byvar' u1 u2 u3 `out', ///
+        "cfg=is_count=0;pct=`pct';has_unit=0;nby=`nby';has_time=0;has_mob=0;has_group=0;nu=3;num_threads=`threads';s_prefix=xk_;all_rows=1;out_zero=1"
+    sort `byvar' u1 u2 u3 rowid
+    if (`nby') by s: gen long `k' = _n
+    else gen long `k' = _n
+    if (`nby') by s: gen long `n' = _N
+    else gen long `n' = _N
+    gen byte `ref' = `k' <= int(`n' * `pct' / 100 + .5)
+    assert `out' == `ref'
+    sort rowid
+end
+clear
+set obs 400000
+gen long rowid = _n
+gen byte touse = 1
+gen int s = mod(_n, 40)
+set seed 7
+gen double u1 = round(runiform(), .01)
+gen double u2 = round(runiform(), .1)
+gen double u3 = runiform()
+foreach threads in 1 8 {
+    xcert_keys 37 1 `threads'
+    xcert_keys 37 0 `threads'
+}
+
+* The draw depends on the order of the unit values only: dense integers,
+* sparse integers, non-integers and shifted integers rank the same units.
+clear
+set obs 30000
+gen long w = ceil(_n / 3)
+gen double w_sparse = w * 1e9 + 12345
+gen double w_half = w + .5
+gen double w_shift = w - 1e15
+gen int f = mod(w * 7 + _n, 97)
+foreach v in w w_sparse w_half w_shift {
+    xsamplefe 20, unit(`v') mobility(f) connectivity seed(3) generate(d_`v') numthreads(8)
+}
+assert d_w == d_w_sparse & d_w == d_w_half & d_w == d_w_shift
+
+* Without if/in the plugin takes the frame from the missing unit and group
+* values; with if 1 it reads the marked sample. Both must agree.
+clear
+set obs 20000
+gen long w = ceil(_n / 5)
+gen int f = mod(_n * 7, 101)
+gen int t = mod(_n, 4)
+replace w = .a if mod(_n, 211) == 0
+replace t = . if mod(_n, 13) == 0
+gen byte g5 = mod(w, 5)
+foreach design in "unit(f) group(w)" "unit(f) group(w) grouprule(all) mobility(t) connectivity" ///
+    "unit(w) mobility(f) time(t) minperiods(2)" "unit(w) by(g5)" "by(t)" "" {
+    xsamplefe 25, `design' seed(5) generate(plain) numthreads(8)
+    local nf = r(N_frame)
+    xsamplefe 25 if 1, `design' seed(5) generate(marked) numthreads(8)
+    assert r(N_frame) == `nf'
+    assert plain == marked
+    drop plain marked
+}
+
+* Two by() columns with missing categories, against native sample.
+clear
+set obs 5000
+gen long rowid = _n
+gen byte a = mod(_n, 5)
+replace a = .a if mod(_n, 17) == 0
+gen double b = mod(_n, 3) + .5
+replace b = . if mod(_n, 11) == 0
+preserve
+set seed 41
+sample 23, by(a b)
+quietly levelsof rowid, local(ids)
+local state = c(rngstate)
+restore
+set seed 41
+xsamplefe 23, by(a b) generate(sb) numthreads(8)
+quietly levelsof rowid if sb, local(actual)
+assert "`ids'" == "`actual'"
+assert c(rngstate) == "`state'"
+
+* reconnect follows its documented rule: when a pick merges a component into
+* the largest one, the units linked to that component's values join the
+* frontier at once. Documented greedy at 61%: M1 (gain 5), then M2 (gain 10,
+* through the value E of the merged component) -> 25 of 27 rows.
+clear
+input byte(w f s n)
+1 1 1 10
+2 2 2 2
+2 5 2 1
+3 3 3 8
+4 4 4 1
+5 6 5 1
+6 1 5 1
+6 2 5 1
+7 5 5 1
+7 3 5 1
+8 1 5 1
+8 4 5 1
+end
+expand n
+drop n
+local chosen 0
+forvalues seed = 1/200 {
+    quietly xsamplefe 1, count by(s) unit(w) mobility(f) seed(`seed') generate(g) replace numthreads(1)
+    quietly count if g & w >= 6
+    local nm = r(N)
+    quietly count if g & w == 5
+    if (`nm' == 0 & r(N) > 0 & `chosen' == 0) local chosen `seed'
+}
+assert `chosen' > 0
+xsamplefe 1, count by(s) unit(w) mobility(f) seed(`chosen') recontarget(61) generate(r) numthreads(1)
+assert r(N_units_reconnected) == 2 & abs(r(lcc_share) - 25 / 27) < 1e-12
+assert r == 1 if inlist(w, 6, 7)
+assert r == 0 if w == 8
+
 noi di as result "XSAMPLEFE ADVERSARIAL CERTIFICATION PASSED"

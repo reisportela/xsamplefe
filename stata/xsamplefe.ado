@@ -1,4 +1,4 @@
-*! version 1.2.3  09sep2026
+*! version 1.3.0  24sep2026
 *! xsamplefe: panel / fixed-effect aware random sampling for reghdfe and xhdfe
 *! - sample / sample2 semantics for the simple cases (drawn rows are
 *!   bit-identical to sample under the same seed and data order)
@@ -153,6 +153,7 @@ program define xsamplefe, rclass byable(onecall)
     // parenthesised groups and c. parts are continuous slopes and are ignored.
     local absvars
     local absvars_display
+    local nint 0
     if (`"`absorb'"' != "") {
         local absorb_raw = strtrim(subinstr(`"`absorb'"', char(9), " ", .))
         gettoken absorb_raw absorb_opts : absorb_raw, parse(",")
@@ -241,9 +242,12 @@ program define xsamplefe, rclass byable(onecall)
                 local absvars_display `absvars_display' `fevars'
             }
             else {
-                tempvar iv
-                quietly egen long `iv' = group(`fevars')
-                local absvars `absvars' `iv'
+                // an interaction is compacted with egen group() only if it
+                // becomes the sampling unit or the mobility dimension (below);
+                // until then it is the token @#, which no variable can match
+                local ++nint
+                local absvars `absvars' @`nint'
+                local int`nint' `fevars'
                 local dsp : subinstr local fevars " " "#", all
                 local absvars_display `absvars_display' `dsp'
             }
@@ -280,8 +284,14 @@ program define xsamplefe, rclass byable(onecall)
     // ---- time (resolved before the mobility default) ------------------------
     local need_time = ("`balanced'" != "" | `minperiods' >= 0 | `maxperiods' >= 0)
     if ("`time'" == "" & `need_time') {
-        capture quietly xtset
-        if (!_rc) local time `r(timevar)'
+        // the xtset time variable is read from the data characteristics, as
+        // xtset resolves it: running xtset would sort the data before if/in
+        local time : char _dta[_TStvar]
+        if ("`time'" != "") {
+            capture unab time : `time', max(1)
+            if (!_rc) capture confirm numeric variable `time'
+            if (_rc) local time
+        }
         if ("`time'" == "") {
             di as err "balanced, minperiods() and maxperiods() require time() or an xtset time variable"
             exit 198
@@ -354,6 +364,15 @@ program define xsamplefe, rclass byable(onecall)
             di as txt "note: option `any'`all' ignored (no sampling unit)"
         }
         else local frame_rule `any'`all'
+    }
+
+    // ---- absorb() interactions used as the unit or the mobility dimension ----
+    foreach m in unit mobility {
+        if (substr("``m''", 1, 1) != "@") continue
+        local j = substr("``m''", 2, .)
+        tempvar iv_`m'
+        quietly egen long `iv_`m'' = group(`int`j'')
+        local `m' `iv_`m''
     }
 
     // ---- string identifiers -> compact numeric codes -------------------------
@@ -442,9 +461,14 @@ program define xsamplefe, rclass byable(onecall)
     local cfg "`cfg'minmovers=`minmov';"
     local cfg "`cfg'connected=`=("`connected'" != "")';num_threads=`numthreads';"
     local cfg "`cfg'verbose=`=("`verbose'" != "")';s_prefix=`sp';"
+    // the plugin call below carries no if/in, and the indicator starts at 0
+    // so that the plugin writes only the retained rows; without if/in the
+    // frame is the rows with a unit (and group) value, read by the plugin
+    local no_ifin = (`"`if'`in'"' == "")
+    local cfg "`cfg'all_rows=1;out_zero=1;frame_from_keys=`no_ifin';"
 
     tempvar out
-    quietly gen byte `out' = .
+    quietly gen byte `out' = 0
 
     // ---- bind the plugin next to the active xsamplefe.ado --------------------
     quietly findfile xsamplefe.ado
@@ -514,10 +538,9 @@ program define xsamplefe, rclass byable(onecall)
 
     // ---- apply ----------------------------------------------------------------
     if ("`generate'" != "") {
-        tempvar gflag
-        quietly gen byte `gflag' = `out'
+        // the byte indicator itself becomes the variable: no copy of _N rows
         if (`gen_exists') drop `generate'
-        rename `gflag' `generate'
+        rename `out' `generate'
         label variable `generate' "xsamplefe: 1 = retained in sample"
     }
     else {

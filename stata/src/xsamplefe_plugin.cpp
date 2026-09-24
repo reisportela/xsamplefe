@@ -13,7 +13,11 @@
 //     uniform draw, so the drawn set depends only on the seed and the set of
 //     unit values, never on the physical row order of the data.
 //   * Every parallel phase is deterministic: results are invariant to the
-//     OpenMP team size (sorts are rank-based, selection is by total order).
+//     OpenMP team size (ranks are functions of the values, selection is by a
+//     strict total order, union-find roots are the smallest node of their
+//     component, and every reduction is an integer sum, min, max or or).
+//   * Stata's plugin interface is called only from the thread that runs the
+//     plugin: reading cells from worker threads corrupts Stata's heap.
 //   * Counts and sizes are kept in 64-bit integers.
 //
 // varlist layout handed over by the ado (all numeric):
@@ -24,7 +28,7 @@
 //   [..]             mob    (if has_mob)
 //   [..]             group  (if has_group; block of inseparable rows)
 //   [..]             u_1 .. u_nu uniform key columns (nu >= 0)
-//   [last]           out    (byte/double target: 1 = retained, 0 = dropped)
+//   [last]           out    (byte target: 1 = retained, 0 = dropped)
 #include "stplugin.h"
 
 #include <algorithm>
@@ -238,6 +242,14 @@ inline int effective_threads() {
 #endif
 }
 
+inline int thread_index() {
+#ifdef _OPENMP
+    return omp_get_thread_num();
+#else
+    return 0;
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // Configuration.
 // ---------------------------------------------------------------------------
@@ -272,6 +284,14 @@ struct Config {
     bool connected = false;
     int num_threads = 0;
     bool verbose = false;
+    // the ado passes neither if nor in to the plugin call, so every row of
+    // the dataset is handed over in order
+    bool all_rows = false;
+    // the ado created the target as 0, so only retained rows are written
+    bool out_zero = false;
+    // no if/in: the frame is exactly the rows with a unit (and group) value,
+    // so the touse column is not read
+    bool frame_from_keys = false;
     std::string s_prefix;
 };
 
@@ -340,6 +360,9 @@ Config parse_config(const ParsedArgs& a) {
     if (auto v = a.optional("connected")) c.connected = parse_bool(*v, "connected");
     if (auto v = a.optional("num_threads")) c.num_threads = parse_int(*v, "num_threads");
     if (auto v = a.optional("verbose")) c.verbose = parse_bool(*v, "verbose");
+    if (auto v = a.optional("all_rows")) c.all_rows = parse_bool(*v, "all_rows");
+    if (auto v = a.optional("out_zero")) c.out_zero = parse_bool(*v, "out_zero");
+    if (auto v = a.optional("frame_from_keys")) c.frame_from_keys = parse_bool(*v, "frame_from_keys");
     if (auto v = a.optional("s_prefix")) c.s_prefix = *v;
     if (c.s_prefix.empty()) c.s_prefix = "__xsf_";
 
@@ -399,43 +422,161 @@ private:
     std::chrono::steady_clock::time_point t0_;
 };
 
-std::vector<int> selected_observations() {
+// Rows handed to the plugin. When the ado asserts that the call carries
+// neither if nor in, the rows are 1.._N in order and no per-row index (nor a
+// per-row SF_ifobs call) is needed; any other caller takes the general path.
+struct ObservationMap {
+    int in1 = 1;
+    int64_t n = 0;
+    bool contiguous = true;
+    std::vector<int> obs;
+    int obs_no(int64_t i) const {
+        return contiguous ? in1 + static_cast<int>(i) : obs[static_cast<std::size_t>(i)];
+    }
+};
+
+ObservationMap selected_observations(bool all_rows) {
+    ObservationMap m;
     const int in1 = SF_in1();
     const int in2 = SF_in2();
-    std::vector<int> obs;
-    if (in2 < in1) return obs;
-    obs.reserve(static_cast<std::size_t>(in2 - in1 + 1));
-    for (int j = in1; j <= in2; ++j) {
-        if (SF_ifobs(j)) obs.push_back(j);
+    m.in1 = in1;
+    if (in2 < in1) return m;
+    if (all_rows && in1 == 1 && in2 == SF_nobs()) {
+        m.n = static_cast<int64_t>(in2) - static_cast<int64_t>(in1) + 1;
+        return m;
     }
-    return obs;
+    m.contiguous = false;
+    m.obs.reserve(static_cast<std::size_t>(in2 - in1 + 1));
+    for (int j = in1; j <= in2; ++j) {
+        if (SF_ifobs(j)) m.obs.push_back(j);
+    }
+    m.n = static_cast<int64_t>(m.obs.size());
+    return m;
 }
 
-void read_column(int var, const std::vector<int>& obs, std::vector<double>& out) {
-    const std::size_t n = obs.size();
-    out.resize(n);
-    for (std::size_t i = 0; i < n; ++i) {
-        ST_double z = 0.0;
-        if (SF_vdata(var, obs[i], &z)) {
-            fail("failed to read variable " + std::to_string(var) + " (obs " + std::to_string(obs[i]) + ")");
-        }
-        out[i] = z;
+inline double read_cell(int var, int obs_no) {
+    ST_double z = 0.0;
+    if (SF_vdata(var, obs_no, &z)) {
+        fail("failed to read variable " + std::to_string(var) + " (obs " + std::to_string(obs_no) + ")");
     }
+    return z;
 }
+
+// The first `count` rows of a column (all of them with count == om.n).
+void read_column(int var, const ObservationMap& om, int64_t count, std::vector<double>& out) {
+    out.resize(static_cast<std::size_t>(count));
+    for (int64_t i = 0; i < count; ++i) out[static_cast<std::size_t>(i)] = read_cell(var, om.obs_no(i));
+}
+
+// Fixed chunks of [0, n): the partition depends only on n, never on the
+// number of threads, so the two-pass scans built on it are deterministic.
+constexpr int64_t kChunks = 1024;
+inline int64_t chunk_begin(int64_t n, int64_t nchunks, int64_t c) { return n * c / nchunks; }
+
+constexpr double kExactIntLimit = 9007199254740992.0;  // 2^53
 
 // Dense rank (0-based, ascending by value) of the rows where mask[i] != 0 and
 // the value is not Stata-missing. Returns the number of distinct values; rows
-// outside the mask (or missing) get id -1.
+// outside the mask (or missing) get id -1. The rank of a value is the number
+// of distinct values below it, whatever the method: integer-valued columns
+// whose range is at most a small multiple of the number of rows are ranked
+// through a bitmap of the values present (parallel, O(n + range)); any other
+// column is sorted.
 int64_t dense_rank_column(const std::vector<double>& v, const std::vector<uint8_t>* mask, double missval,
-                          std::vector<int32_t>& id) {
-    const std::size_t n = v.size();
+                          std::vector<int32_t>& id, ThreadStats& ts) {
+    const int64_t n = static_cast<int64_t>(v.size());
+    id.assign(static_cast<std::size_t>(n), -1);
+    int64_t cnt = 0;
+    double lo = std::numeric_limits<double>::infinity();
+    double hi = -std::numeric_limits<double>::infinity();
+    bool integral = true;
+#pragma omp parallel
+    {
+        observe_team(ts);
+        int64_t t_cnt = 0;
+        double t_lo = std::numeric_limits<double>::infinity();
+        double t_hi = -std::numeric_limits<double>::infinity();
+        bool t_int = true;
+#pragma omp for schedule(static) nowait
+        for (int64_t i = 0; i < n; ++i) {
+            if (mask && !(*mask)[static_cast<std::size_t>(i)]) continue;
+            const double z = v[static_cast<std::size_t>(i)];
+            if (!(z < missval)) continue;
+            ++t_cnt;
+            if (!(z >= -kExactIntLimit && z <= kExactIntLimit) || std::trunc(z) != z) t_int = false;
+            if (z < t_lo) t_lo = z;
+            if (z > t_hi) t_hi = z;
+        }
+#pragma omp critical(xsf_rank_scan)
+        {
+            cnt += t_cnt;
+            integral = integral && t_int;
+            if (t_lo < lo) lo = t_lo;
+            if (t_hi > hi) hi = t_hi;
+        }
+    }
+    if (cnt == 0) return 0;
+
+    if (integral) {
+        const int64_t base = static_cast<int64_t>(lo);
+        const int64_t span = static_cast<int64_t>(hi) - base;
+        const int64_t limit = std::max<int64_t>(int64_t(1) << 20, 16 * cnt);
+        if (span < limit) {
+            const int64_t nwords = span / 64 + 1;
+            std::vector<uint64_t> bits(static_cast<std::size_t>(nwords), 0);
+#pragma omp parallel
+            {
+                observe_team(ts);
+#pragma omp for schedule(static)
+                for (int64_t i = 0; i < n; ++i) {
+                    if (mask && !(*mask)[static_cast<std::size_t>(i)]) continue;
+                    const double z = v[static_cast<std::size_t>(i)];
+                    if (!(z < missval)) continue;
+                    const uint64_t q = static_cast<uint64_t>(static_cast<int64_t>(z) - base);
+                    uint64_t& word = bits[static_cast<std::size_t>(q >> 6)];
+                    const uint64_t bit = uint64_t(1) << (q & 63);
+                    uint64_t cur;
+#pragma omp atomic read
+                    cur = word;
+                    if (!(cur & bit)) {
+#pragma omp atomic update
+                        word |= bit;
+                    }
+                }
+            }
+            std::vector<int64_t> before(static_cast<std::size_t>(nwords));
+            int64_t acc = 0;
+            for (int64_t w = 0; w < nwords; ++w) {
+                before[static_cast<std::size_t>(w)] = acc;
+                acc += __builtin_popcountll(bits[static_cast<std::size_t>(w)]);
+            }
+#pragma omp parallel
+            {
+                observe_team(ts);
+#pragma omp for schedule(static)
+                for (int64_t i = 0; i < n; ++i) {
+                    if (mask && !(*mask)[static_cast<std::size_t>(i)]) continue;
+                    const double z = v[static_cast<std::size_t>(i)];
+                    if (!(z < missval)) continue;
+                    const uint64_t q = static_cast<uint64_t>(static_cast<int64_t>(z) - base);
+                    const std::size_t w = static_cast<std::size_t>(q >> 6);
+                    const uint64_t below = (uint64_t(1) << (q & 63)) - 1;
+                    id[static_cast<std::size_t>(i)] =
+                        static_cast<int32_t>(before[w] + __builtin_popcountll(bits[w] & below));
+                }
+            }
+            return acc;
+        }
+    }
+
     std::vector<int32_t> idx;
-    idx.reserve(n);
-    for (std::size_t i = 0; i < n; ++i) {
-        if ((!mask || (*mask)[i]) && v[i] < missval) idx.push_back(static_cast<int32_t>(i));
+    idx.reserve(static_cast<std::size_t>(cnt));
+    for (int64_t i = 0; i < n; ++i) {
+        if ((!mask || (*mask)[static_cast<std::size_t>(i)]) && v[static_cast<std::size_t>(i)] < missval) {
+            idx.push_back(static_cast<int32_t>(i));
+        }
     }
     XSF_PARALLEL_SORT(idx.begin(), idx.end(), [&](int32_t a, int32_t b) { return v[a] < v[b]; });
-    id.assign(n, -1);
     int64_t next = -1;
     double prev = 0.0;
     for (std::size_t k = 0; k < idx.size(); ++k) {
@@ -449,12 +590,9 @@ int64_t dense_rank_column(const std::vector<double>& v, const std::vector<uint8_
     return next + 1;
 }
 
-// Lexicographic dense rank of a tuple of columns (strata). Stata missing
-// values are ordinary categories here (as in `sample, by()`, where rows with
-// a missing by() value form their own group); they sort after every
-// non-missing value because Stata encodes them as large doubles.
-int64_t dense_rank_tuple(const std::vector<std::vector<double>>& cols, const std::vector<uint8_t>& mask,
-                         std::vector<int32_t>& id) {
+// Lexicographic dense rank of a tuple of columns by sorting (general path).
+int64_t dense_rank_tuple_sort(const std::vector<std::vector<double>>& cols, const std::vector<uint8_t>& mask,
+                              std::vector<int32_t>& id) {
     const std::size_t n = mask.size();
     const std::size_t k = cols.size();
     std::vector<int32_t> idx;
@@ -480,44 +618,240 @@ int64_t dense_rank_tuple(const std::vector<std::vector<double>>& cols, const std
     return next + 1;
 }
 
+// Lexicographic dense rank of a tuple of columns (strata). Stata missing
+// values are ordinary categories here (as in `sample, by()`, where rows with
+// a missing by() value form their own group); they sort after every
+// non-missing value because Stata encodes them as large doubles. Each column
+// is coded by the rank of its value (non-missing values by their dense rank,
+// then the missing values present, in Stata's order), so the lexicographic
+// order of the tuples is the order of the mixed-radix number of the codes.
+int64_t dense_rank_tuple(const std::vector<std::vector<double>>& cols, const std::vector<uint8_t>& mask,
+                         double missval, std::vector<int32_t>& id, ThreadStats& ts) {
+    const std::size_t k = cols.size();
+    const int64_t n = static_cast<int64_t>(mask.size());
+    std::vector<std::vector<int32_t>> code(k);
+    std::vector<int64_t> card(k, 0);
+    for (std::size_t c = 0; c < k; ++c) {
+        const std::vector<double>& v = cols[c];
+        const int64_t d = dense_rank_column(v, &mask, missval, code[c], ts);
+        // distinct missing values present: Stata has 27 (., .a, ..., .z), so
+        // fixed arrays hold them and nothing is allocated in the parallel region
+        constexpr int kMaxMissing = 32;
+        double seen[kMaxMissing];
+        int nseen = 0;
+        bool too_many = false;
+#pragma omp parallel
+        {
+            observe_team(ts);
+            double local[kMaxMissing];
+            int nlocal = 0;
+            bool over = false;
+#pragma omp for schedule(static) nowait
+            for (int64_t i = 0; i < n; ++i) {
+                const double z = v[static_cast<std::size_t>(i)];
+                if (!mask[static_cast<std::size_t>(i)] || z < missval) continue;
+                if (std::find(local, local + nlocal, z) != local + nlocal) continue;
+                if (nlocal < kMaxMissing) local[nlocal++] = z;
+                else over = true;
+            }
+#pragma omp critical(xsf_tuple_missing)
+            {
+                too_many = too_many || over;
+                for (int j = 0; j < nlocal; ++j) {
+                    if (std::find(seen, seen + nseen, local[j]) != seen + nseen) continue;
+                    if (nseen < kMaxMissing) seen[nseen++] = local[j];
+                    else too_many = true;
+                }
+            }
+        }
+        if (too_many) fail("unexpected number of distinct missing values in by()");
+        std::vector<double> miss(seen, seen + nseen);
+        std::sort(miss.begin(), miss.end());
+        if (!miss.empty()) {
+            std::vector<int32_t>& cc = code[c];
+#pragma omp parallel
+            {
+                observe_team(ts);
+#pragma omp for schedule(static)
+                for (int64_t i = 0; i < n; ++i) {
+                    const double z = v[static_cast<std::size_t>(i)];
+                    if (!mask[static_cast<std::size_t>(i)] || z < missval) continue;
+                    const auto pos = std::lower_bound(miss.begin(), miss.end(), z) - miss.begin();
+                    cc[static_cast<std::size_t>(i)] = static_cast<int32_t>(d + pos);
+                }
+            }
+        }
+        card[c] = d + static_cast<int64_t>(miss.size());
+    }
+    // one column: its codes are already dense
+    if (k == 1) {
+        id.swap(code[0]);
+        return card[0];
+    }
+    int64_t radix = 1;
+    for (std::size_t c = 0; c < k; ++c) {
+        if (card[c] == 0) {
+            radix = 0;
+            break;
+        }
+        if (radix > static_cast<int64_t>(kExactIntLimit) / card[c]) return dense_rank_tuple_sort(cols, mask, id);
+        radix *= card[c];
+    }
+    std::vector<double> key(static_cast<std::size_t>(n), 0.0);
+    if (radix > 0) {
+#pragma omp parallel
+        {
+            observe_team(ts);
+#pragma omp for schedule(static)
+            for (int64_t i = 0; i < n; ++i) {
+                if (!mask[static_cast<std::size_t>(i)]) continue;
+                int64_t q = 0;
+                for (std::size_t c = 0; c < k; ++c) q = q * card[c] + code[c][static_cast<std::size_t>(i)];
+                key[static_cast<std::size_t>(i)] = static_cast<double>(q);
+            }
+        }
+    }
+    return dense_rank_column(key, &mask, missval, id, ts);
+}
+
+// Re-number the ids present in a mask, keeping their order: ids ranked over a
+// superset of the rows become the dense rank over the masked rows.
+int64_t compact_ids(const std::vector<int32_t>& src, int64_t nsrc, const std::vector<uint8_t>& mask,
+                    std::vector<int32_t>& out, ThreadStats& ts) {
+    const int64_t n = static_cast<int64_t>(src.size());
+    std::vector<uint8_t> present(static_cast<std::size_t>(nsrc), 0);
+#pragma omp parallel
+    {
+        observe_team(ts);
+#pragma omp for schedule(static)
+        for (int64_t i = 0; i < n; ++i) {
+            const int32_t b = src[static_cast<std::size_t>(i)];
+            if (!mask[static_cast<std::size_t>(i)] || b < 0) continue;
+            uint8_t cur;
+#pragma omp atomic read
+            cur = present[static_cast<std::size_t>(b)];
+            if (!cur) {
+#pragma omp atomic write
+                present[static_cast<std::size_t>(b)] = 1;
+            }
+        }
+    }
+    std::vector<int32_t> remap(static_cast<std::size_t>(nsrc), -1);
+    int64_t next = 0;
+    for (int64_t b = 0; b < nsrc; ++b) {
+        if (present[static_cast<std::size_t>(b)]) remap[static_cast<std::size_t>(b)] = static_cast<int32_t>(next++);
+    }
+    out.assign(static_cast<std::size_t>(n), -1);
+#pragma omp parallel
+    {
+        observe_team(ts);
+#pragma omp for schedule(static)
+        for (int64_t i = 0; i < n; ++i) {
+            const int32_t b = src[static_cast<std::size_t>(i)];
+            if (mask[static_cast<std::size_t>(i)] && b >= 0) out[static_cast<std::size_t>(i)] = remap[static_cast<std::size_t>(b)];
+        }
+    }
+    return next;
+}
+
 // Compressed row storage: rows grouped by id, in physical row order.
 struct Csr {
     std::vector<int64_t> off;
     std::vector<int32_t> rows;
 };
 
-Csr build_csr(const std::vector<int32_t>& id, int64_t nid, const std::vector<uint8_t>* mask) {
+// The same CSR as build_csr, built in parallel: the rows are partitioned into
+// ranges of ids over fixed chunks of rows (so every range keeps the row
+// order), then every range of ids is laid out by one thread in row order.
+Csr build_csr_parallel(const std::vector<int32_t>& id, int64_t nid, const std::vector<uint8_t>* mask,
+                       ThreadStats& ts) {
     Csr csr;
     csr.off.assign(static_cast<std::size_t>(nid) + 1, 0);
-    const std::size_t n = id.size();
-    for (std::size_t i = 0; i < n; ++i) {
-        if ((!mask || (*mask)[i]) && id[i] >= 0) ++csr.off[static_cast<std::size_t>(id[i]) + 1];
+    const int64_t n = static_cast<int64_t>(id.size());
+    if (nid <= 0 || n == 0) return csr;
+    const int64_t nchunks = std::max<int64_t>(1, std::min<int64_t>(n, kChunks));
+    const int64_t nparts = std::max<int64_t>(1, std::min<int64_t>(nid, 256));
+    auto part_of = [&](int32_t v) { return static_cast<int64_t>(v) * nparts / nid; };
+    auto part_lo = [&](int64_t q) { return (q * nid + nparts - 1) / nparts; };
+    auto counted = [&](int64_t i) {
+        return (!mask || (*mask)[static_cast<std::size_t>(i)]) && id[static_cast<std::size_t>(i)] >= 0;
+    };
+    std::vector<int64_t> at(static_cast<std::size_t>(nchunks * nparts), 0);
+#pragma omp parallel
+    {
+        observe_team(ts);
+#pragma omp for schedule(static)
+        for (int64_t c = 0; c < nchunks; ++c) {
+            int64_t* row_at = at.data() + c * nparts;
+            for (int64_t i = chunk_begin(n, nchunks, c); i < chunk_begin(n, nchunks, c + 1); ++i) {
+                if (counted(i)) ++row_at[part_of(id[static_cast<std::size_t>(i)])];
+            }
+        }
     }
-    for (std::size_t g = 0; g < static_cast<std::size_t>(nid); ++g) csr.off[g + 1] += csr.off[g];
-    csr.rows.resize(static_cast<std::size_t>(csr.off[static_cast<std::size_t>(nid)]));
-    std::vector<int64_t> cur(csr.off.begin(), csr.off.end() - 1);
-    for (std::size_t i = 0; i < n; ++i) {
-        if ((!mask || (*mask)[i]) && id[i] >= 0) {
-            csr.rows[static_cast<std::size_t>(cur[static_cast<std::size_t>(id[i])]++)] = static_cast<int32_t>(i);
+    // positions part by part, and chunk by chunk inside a part
+    std::vector<int64_t> part_first(static_cast<std::size_t>(nparts) + 1, 0);
+    int64_t run = 0;
+    for (int64_t q = 0; q < nparts; ++q) {
+        part_first[static_cast<std::size_t>(q)] = run;
+        for (int64_t c = 0; c < nchunks; ++c) {
+            const int64_t k = at[static_cast<std::size_t>(c * nparts + q)];
+            at[static_cast<std::size_t>(c * nparts + q)] = run;
+            run += k;
+        }
+    }
+    part_first[static_cast<std::size_t>(nparts)] = run;
+    std::vector<int32_t> by_part(static_cast<std::size_t>(run));
+    csr.rows.resize(static_cast<std::size_t>(run));
+    std::vector<int64_t> cur(static_cast<std::size_t>(nid), 0);
+#pragma omp parallel
+    {
+        observe_team(ts);
+#pragma omp for schedule(static)
+        for (int64_t c = 0; c < nchunks; ++c) {
+            int64_t* row_at = at.data() + c * nparts;
+            for (int64_t i = chunk_begin(n, nchunks, c); i < chunk_begin(n, nchunks, c + 1); ++i) {
+                if (counted(i)) by_part[static_cast<std::size_t>(row_at[part_of(id[static_cast<std::size_t>(i)])]++)] = static_cast<int32_t>(i);
+            }
+        }
+#pragma omp for schedule(dynamic, 1)
+        for (int64_t q = 0; q < nparts; ++q) {
+            const int64_t v_lo = part_lo(q);
+            const int64_t v_hi = part_lo(q + 1);
+            const int64_t k_lo = part_first[static_cast<std::size_t>(q)];
+            const int64_t k_hi = part_first[static_cast<std::size_t>(q) + 1];
+            // this part owns off[v_lo + 1 .. v_hi] and cur[v_lo .. v_hi - 1]
+            for (int64_t k = k_lo; k < k_hi; ++k) ++csr.off[static_cast<std::size_t>(id[static_cast<std::size_t>(by_part[static_cast<std::size_t>(k)])]) + 1];
+            int64_t start = k_lo;
+            for (int64_t v = v_lo; v < v_hi; ++v) {
+                cur[static_cast<std::size_t>(v)] = start;
+                start += csr.off[static_cast<std::size_t>(v) + 1];
+                csr.off[static_cast<std::size_t>(v) + 1] = start;
+            }
+            for (int64_t k = k_lo; k < k_hi; ++k) {
+                const int32_t row = by_part[static_cast<std::size_t>(k)];
+                csr.rows[static_cast<std::size_t>(cur[static_cast<std::size_t>(id[static_cast<std::size_t>(row)])]++)] = row;
+            }
         }
     }
     return csr;
 }
 
-// Number of distinct non-negative ids in buf (negative = Stata missing,
-// which never counts as a period or a link).
-int32_t count_distinct_sorted(std::vector<int32_t>& buf) {
-    if (buf.empty()) return 0;
-    std::sort(buf.begin(), buf.end());
+// Number of distinct non-negative ids in [first, last) (negative = Stata
+// missing, which never counts as a period or a link); sorts the range in place.
+int32_t count_distinct_sorted(int32_t* first, int32_t* last) {
+    if (first == last) return 0;
+    std::sort(first, last);
     int32_t d = 0;
-    for (std::size_t k = 0; k < buf.size(); ++k) {
-        if (buf[k] < 0) continue;
-        if (d == 0 || buf[k] != buf[k - 1]) ++d;
+    for (int32_t* it = first; it != last; ++it) {
+        if (*it < 0) continue;
+        if (d == 0 || *it != *(it - 1)) ++d;
     }
     return d;
 }
 
-// Iterative union-find with path halving (deterministic, serial use).
+// Iterative union-find with path halving (deterministic, serial use). The
+// larger root always goes under the smaller one, so the root of a component
+// is its smallest node whatever the order of the unions.
 struct UnionFind {
     std::vector<int32_t> parent;
     explicit UnionFind(int64_t n) : parent(static_cast<std::size_t>(n)) {
@@ -583,6 +917,18 @@ inline uint64_t double_bits(double d) {
     return b;
 }
 
+// Monotone bucket of a uniform key: x <= y implies bucket(x) <= bucket(y).
+constexpr int kKeyBuckets = 1 << 16;
+inline int key_bucket(double x) {
+    if (!(x > 0.0)) return 0;
+    if (!(x < 1.0)) return kKeyBuckets - 1;
+    return static_cast<int>(x * static_cast<double>(kKeyBuckets));
+}
+
+// Strata at least this large are drawn one at a time with parallel passes;
+// smaller strata are drawn in parallel, one stratum per task.
+constexpr int64_t kBigStratum = int64_t(1) << 18;
+
 }  // namespace
 
 STDLL stata_call(int argc, char* argv[]) {
@@ -612,74 +958,105 @@ STDLL stata_call(int argc, char* argv[]) {
         cursor += cfg.nu;
         const int idx_out = cursor;
 
-        const std::vector<int> obs = selected_observations();
-        const int64_t n = static_cast<int64_t>(obs.size());
+        const ObservationMap om = selected_observations(cfg.all_rows);
+        const int64_t n = om.n;
         check_index_space(n, "the number of observations");
         const double missval = SV_missval;
 
         // ---- read columns ---------------------------------------------------
+        // Stata's plugin interface is read from this thread only. The uniform
+        // keys are read later, once the number of units is known.
         std::vector<uint8_t> frame(static_cast<std::size_t>(n), 0);
-        {
-            std::vector<double> t;
-            read_column(idx_touse, obs, t);
+        if (!cfg.frame_from_keys) {
             for (int64_t i = 0; i < n; ++i) {
-                frame[static_cast<std::size_t>(i)] = (t[static_cast<std::size_t>(i)] < missval &&
-                                                      t[static_cast<std::size_t>(i)] != 0.0)
-                                                         ? 1
-                                                         : 0;
+                const double t = read_cell(idx_touse, om.obs_no(i));
+                frame[static_cast<std::size_t>(i)] = (t < missval && t != 0.0) ? 1 : 0;
             }
         }
         std::vector<double> unit_raw, time_raw, mob_raw, group_raw;
         std::vector<std::vector<double>> by_raw(static_cast<std::size_t>(cfg.nby));
-        std::vector<std::vector<double>> u_raw(static_cast<std::size_t>(cfg.nu));
-        if (cfg.has_unit) read_column(idx_unit, obs, unit_raw);
-        for (int c = 0; c < cfg.nby; ++c) read_column(idx_by + c, obs, by_raw[static_cast<std::size_t>(c)]);
-        if (cfg.has_time) read_column(idx_time, obs, time_raw);
-        if (cfg.has_mob) read_column(idx_mob, obs, mob_raw);
-        if (cfg.has_group) read_column(idx_group, obs, group_raw);
-        for (int c = 0; c < cfg.nu; ++c) read_column(idx_u + c, obs, u_raw[static_cast<std::size_t>(c)]);
-        timer.mark("read");
-
-        // ---- if/in frame rule on inseparable blocks -------------------------
-        // The block is the group() variable when present, else the unit. A
-        // block that has rows both inside and outside if/in is "split".
-        int64_t n_split = 0;
-        if (cfg.has_unit) {
-            const std::vector<double>& block_raw = cfg.has_group ? group_raw : unit_raw;
-            std::vector<int32_t> block_id;
-            const int64_t nblock = dense_rank_column(block_raw, nullptr, missval, block_id);
-            const Csr bcsr = build_csr(block_id, nblock, nullptr);
-            std::vector<uint8_t> split(static_cast<std::size_t>(nblock), 0);
+        if (cfg.has_unit) read_column(idx_unit, om, n, unit_raw);
+        for (int c = 0; c < cfg.nby; ++c) read_column(idx_by + c, om, n, by_raw[static_cast<std::size_t>(c)]);
+        if (cfg.has_time) read_column(idx_time, om, n, time_raw);
+        if (cfg.has_mob) read_column(idx_mob, om, n, mob_raw);
+        if (cfg.has_group) read_column(idx_group, om, n, group_raw);
+        if (cfg.frame_from_keys) {
+            // the ado's markout: a row is in the frame when its unit (and
+            // group) value is not missing
 #pragma omp parallel
             {
                 observe_team(ts);
 #pragma omp for schedule(static)
-                for (int64_t b = 0; b < nblock; ++b) {
-                    const int64_t lo = bcsr.off[static_cast<std::size_t>(b)];
-                    const int64_t hi = bcsr.off[static_cast<std::size_t>(b) + 1];
-                    int64_t inside = 0;
-                    for (int64_t k = lo; k < hi; ++k) inside += frame[static_cast<std::size_t>(bcsr.rows[static_cast<std::size_t>(k)])];
-                    if (inside > 0 && inside < hi - lo) {
-                        split[static_cast<std::size_t>(b)] = 1;
-                        if (cfg.frame_rule == FrameRule::Any) {
-                            for (int64_t k = lo; k < hi; ++k) frame[static_cast<std::size_t>(bcsr.rows[static_cast<std::size_t>(k)])] = 1;
-                        } else if (cfg.frame_rule == FrameRule::All) {
-                            for (int64_t k = lo; k < hi; ++k) frame[static_cast<std::size_t>(bcsr.rows[static_cast<std::size_t>(k)])] = 0;
+                for (int64_t i = 0; i < n; ++i) {
+                    const std::size_t ii = static_cast<std::size_t>(i);
+                    bool in = true;
+                    if (cfg.has_unit && !(unit_raw[ii] < missval)) in = false;
+                    if (cfg.has_group && !(group_raw[ii] < missval)) in = false;
+                    frame[ii] = in ? 1 : 0;
+                }
+            }
+        }
+        timer.mark("read");
+
+        // ---- if/in frame rule on inseparable blocks -------------------------
+        // The block is the group() variable when present, else the unit. A
+        // block that has rows both inside and outside if/in is "split". No
+        // block can be split when every row with a block value is inside the
+        // frame (the usual case without if/in), and the ranking is skipped.
+        int64_t n_split = 0;
+        std::vector<int32_t> block_id;
+        int64_t nblock = -1;  // -1: blocks not ranked
+        if (cfg.has_unit) {
+            const std::vector<double>& block_raw = cfg.has_group ? group_raw : unit_raw;
+            bool outside = false;
+#pragma omp parallel
+            {
+                observe_team(ts);
+#pragma omp for schedule(static) reduction(|| : outside)
+                for (int64_t i = 0; i < n; ++i) {
+                    if (!frame[static_cast<std::size_t>(i)] && block_raw[static_cast<std::size_t>(i)] < missval) outside = true;
+                }
+            }
+            if (outside) {
+                nblock = dense_rank_column(block_raw, nullptr, missval, block_id, ts);
+                const Csr bcsr = build_csr_parallel(block_id, nblock, nullptr, ts);
+                std::vector<uint8_t> split(static_cast<std::size_t>(nblock), 0);
+#pragma omp parallel
+                {
+                    observe_team(ts);
+#pragma omp for schedule(static)
+                    for (int64_t b = 0; b < nblock; ++b) {
+                        const int64_t lo = bcsr.off[static_cast<std::size_t>(b)];
+                        const int64_t hi = bcsr.off[static_cast<std::size_t>(b) + 1];
+                        int64_t inside = 0;
+                        for (int64_t k = lo; k < hi; ++k) inside += frame[static_cast<std::size_t>(bcsr.rows[static_cast<std::size_t>(k)])];
+                        if (inside > 0 && inside < hi - lo) {
+                            split[static_cast<std::size_t>(b)] = 1;
+                            if (cfg.frame_rule == FrameRule::Any) {
+                                for (int64_t k = lo; k < hi; ++k) frame[static_cast<std::size_t>(bcsr.rows[static_cast<std::size_t>(k)])] = 1;
+                            } else if (cfg.frame_rule == FrameRule::All) {
+                                for (int64_t k = lo; k < hi; ++k) frame[static_cast<std::size_t>(bcsr.rows[static_cast<std::size_t>(k)])] = 0;
+                            }
                         }
                     }
                 }
-            }
-            for (int64_t b = 0; b < nblock; ++b) n_split += split[static_cast<std::size_t>(b)];
-            if (cfg.frame_rule == FrameRule::Strict && n_split > 0) {
-                fail(std::to_string(n_split) + (cfg.has_group ? " group(s)" : " unit(s)") +
-                     " have rows both inside and outside if/in; sampling units must be complete "
-                     "(specify option any or all to resolve)");
+                for (int64_t b = 0; b < nblock; ++b) n_split += split[static_cast<std::size_t>(b)];
+                if (cfg.frame_rule == FrameRule::Strict && n_split > 0) {
+                    fail(std::to_string(n_split) + (cfg.has_group ? " group(s)" : " unit(s)") +
+                         " have rows both inside and outside if/in; sampling units must be complete "
+                         "(specify option any or all to resolve)");
+                }
             }
             timer.mark("frame rule");
         }
 
         int64_t n_frame = 0;
-        for (int64_t i = 0; i < n; ++i) n_frame += frame[static_cast<std::size_t>(i)];
+#pragma omp parallel
+        {
+            observe_team(ts);
+#pragma omp for schedule(static) reduction(+ : n_frame)
+            for (int64_t i = 0; i < n; ++i) n_frame += frame[static_cast<std::size_t>(i)];
+        }
 
         // Rows pulled into the frame by `any` must carry every required key.
         if (n_frame > 0 && cfg.frame_rule == FrameRule::Any && n_split > 0) {
@@ -698,60 +1075,136 @@ STDLL stata_call(int argc, char* argv[]) {
         }
 
         // ---- ids over frame rows ------------------------------------------
-        std::vector<int32_t> unit_id(static_cast<std::size_t>(n), -1);
+        std::vector<int32_t> unit_id;
+        std::vector<int32_t> key_row;  // observation mode: unit -> row
         int64_t U = 0;
-        if (n_frame > 0) {
-            if (cfg.has_unit) {
-                U = dense_rank_column(unit_raw, &frame, missval, unit_id);
+        if (cfg.has_unit) {
+            if (n_frame > 0 && nblock >= 0 && !cfg.has_group) {
+                // the units are the blocks already ranked over every row
+                U = compact_ids(block_id, nblock, frame, unit_id, ts);
+            } else if (n_frame > 0) {
+                U = dense_rank_column(unit_raw, &frame, missval, unit_id, ts);
             } else {
-                // Observation-level sampling: every frame row is its own unit,
-                // numbered in physical order (the row keeps its own uniforms).
-                for (int64_t i = 0; i < n; ++i) {
-                    if (frame[static_cast<std::size_t>(i)]) unit_id[static_cast<std::size_t>(i)] = static_cast<int32_t>(U++);
+                unit_id.assign(static_cast<std::size_t>(n), -1);
+            }
+        } else {
+            // Observation-level sampling: every frame row is its own unit,
+            // numbered in physical order (the row keeps its own uniforms).
+            unit_id.assign(static_cast<std::size_t>(n), -1);
+            key_row.assign(static_cast<std::size_t>(n_frame), 0);
+            const int64_t nchunks = std::max<int64_t>(1, std::min<int64_t>(n, kChunks));
+            std::vector<int64_t> first(static_cast<std::size_t>(nchunks) + 1, 0);
+#pragma omp parallel
+            {
+                observe_team(ts);
+#pragma omp for schedule(static)
+                for (int64_t c = 0; c < nchunks; ++c) {
+                    int64_t cnt = 0;
+                    for (int64_t i = chunk_begin(n, nchunks, c); i < chunk_begin(n, nchunks, c + 1); ++i) {
+                        cnt += frame[static_cast<std::size_t>(i)];
+                    }
+                    first[static_cast<std::size_t>(c) + 1] = cnt;
                 }
             }
+            for (int64_t c = 0; c < nchunks; ++c) first[static_cast<std::size_t>(c) + 1] += first[static_cast<std::size_t>(c)];
+#pragma omp parallel
+            {
+                observe_team(ts);
+#pragma omp for schedule(static)
+                for (int64_t c = 0; c < nchunks; ++c) {
+                    int64_t u = first[static_cast<std::size_t>(c)];
+                    for (int64_t i = chunk_begin(n, nchunks, c); i < chunk_begin(n, nchunks, c + 1); ++i) {
+                        if (!frame[static_cast<std::size_t>(i)]) continue;
+                        unit_id[static_cast<std::size_t>(i)] = static_cast<int32_t>(u);
+                        key_row[static_cast<std::size_t>(u)] = static_cast<int32_t>(i);
+                        ++u;
+                    }
+                }
+            }
+            U = n_frame;
         }
-        std::vector<int32_t> strata_id(static_cast<std::size_t>(n), -1);
+        std::vector<int32_t> strata_id;
         int64_t S = 1;
         if (cfg.nby > 0) {
-            S = dense_rank_tuple(by_raw, frame, strata_id);
+            S = dense_rank_tuple(by_raw, frame, missval, strata_id, ts);
         } else {
-            for (int64_t i = 0; i < n; ++i) {
-                if (frame[static_cast<std::size_t>(i)]) strata_id[static_cast<std::size_t>(i)] = 0;
+            strata_id.assign(static_cast<std::size_t>(n), -1);
+#pragma omp parallel
+            {
+                observe_team(ts);
+#pragma omp for schedule(static)
+                for (int64_t i = 0; i < n; ++i) {
+                    if (frame[static_cast<std::size_t>(i)]) strata_id[static_cast<std::size_t>(i)] = 0;
+                }
             }
         }
         std::vector<int32_t> time_id, mob_id, group_id;
         int64_t T = 0, M = 0, G = 0;
-        if (cfg.has_time) T = dense_rank_column(time_raw, &frame, missval, time_id);
-        if (cfg.has_mob) M = dense_rank_column(mob_raw, &frame, missval, mob_id);
-        if (cfg.has_group) G = dense_rank_column(group_raw, &frame, missval, group_id);
+        if (cfg.has_time) T = dense_rank_column(time_raw, &frame, missval, time_id, ts);
+        if (cfg.has_mob) M = dense_rank_column(mob_raw, &frame, missval, mob_id, ts);
+        if (cfg.has_group) {
+            G = (nblock >= 0) ? compact_ids(block_id, nblock, frame, group_id, ts)
+                              : dense_rank_column(group_raw, &frame, missval, group_id, ts);
+        }
         // the unit-mobility graph numbers units 0..U-1 and mobility values U..U+M-1
         if (cfg.has_mob) check_index_space(U + M, "the number of units plus mobility values");
+        // the raw columns are not needed any more
+        std::vector<double>().swap(unit_raw);
+        std::vector<double>().swap(time_raw);
+        std::vector<double>().swap(mob_raw);
+        std::vector<double>().swap(group_raw);
+        std::vector<std::vector<double>>().swap(by_raw);
+        std::vector<int32_t>().swap(block_id);
         timer.mark("ids");
 
-        // Row -> uniform key row: observation mode uses the row's own draws,
-        // unit mode uses the r-th draw for the r-th smallest unit value.
-        std::vector<int32_t> key_row(static_cast<std::size_t>(U), 0);
-        if (cfg.has_unit) {
-            for (int64_t u = 0; u < U; ++u) key_row[static_cast<std::size_t>(u)] = static_cast<int32_t>(u);
-        } else {
-            for (int64_t i = 0; i < n; ++i) {
-                const int32_t u = unit_id[static_cast<std::size_t>(i)];
-                if (u >= 0) key_row[static_cast<std::size_t>(u)] = static_cast<int32_t>(i);
+        // ---- uniform keys -------------------------------------------------------
+        // Unit mode: the r-th smallest unit value takes the r-th draw, so only
+        // the first U rows of the first key column are read. Observation mode:
+        // the first column is read on the frame rows; the further columns only
+        // decide ties on the first and are read for the tied rows alone.
+        std::vector<double> key1;  // unit mode: by unit; observation mode: by frame unit
+        if (cfg.nu > 0 && U > 0) {
+            if (cfg.has_unit) {
+                read_column(idx_u, om, U, key1);
+            } else {
+                key1.resize(static_cast<std::size_t>(U));
+                for (int64_t u = 0; u < U; ++u) {
+                    key1[static_cast<std::size_t>(u)] = read_cell(idx_u, om.obs_no(key_row[static_cast<std::size_t>(u)]));
+                }
             }
         }
+        timer.mark("keys");
 
         // ---- per-unit aggregates ------------------------------------------
-        const Csr ucsr = build_csr(unit_id, U, &frame);
+        // rows of every unit; in observation mode every unit is one row
+        Csr ucsr;
+        if (cfg.has_unit) {
+            ucsr = build_csr_parallel(unit_id, U, &frame, ts);
+        } else {
+            ucsr.off.resize(static_cast<std::size_t>(U) + 1);
+            ucsr.rows.resize(static_cast<std::size_t>(U));
+#pragma omp parallel
+            {
+                observe_team(ts);
+#pragma omp for schedule(static)
+                for (int64_t u = 0; u <= U; ++u) {
+                    ucsr.off[static_cast<std::size_t>(u)] = u;
+                    if (u < U) ucsr.rows[static_cast<std::size_t>(u)] = key_row[static_cast<std::size_t>(u)];
+                }
+            }
+        }
+        timer.mark("unit rows");
         std::vector<int64_t> u_nobs(static_cast<std::size_t>(U), 0);
         std::vector<int32_t> u_nper(static_cast<std::size_t>(U), 0);
         std::vector<int32_t> u_nmob(static_cast<std::size_t>(U), 0);
         std::vector<int32_t> u_str(static_cast<std::size_t>(U), 0);
         std::vector<uint8_t> u_conf(static_cast<std::size_t>(U), 0);
+        // scratch aligned with the unit CSR: every unit sorts its own slice,
+        // and nothing is allocated inside a parallel region
+        std::vector<int32_t> row_scratch(ucsr.rows.size());
 #pragma omp parallel
         {
             observe_team(ts);
-            std::vector<int32_t> buf;
 #pragma omp for schedule(dynamic, 256)
             for (int64_t u = 0; u < U; ++u) {
                 const int64_t lo = ucsr.off[static_cast<std::size_t>(u)];
@@ -766,15 +1219,14 @@ STDLL stata_call(int argc, char* argv[]) {
                         break;
                     }
                 }
+                int32_t* slice = row_scratch.data() + lo;
                 if (cfg.has_time) {
-                    buf.resize(static_cast<std::size_t>(hi - lo));
-                    for (int64_t k = lo; k < hi; ++k) buf[static_cast<std::size_t>(k - lo)] = time_id[static_cast<std::size_t>(ucsr.rows[static_cast<std::size_t>(k)])];
-                    u_nper[static_cast<std::size_t>(u)] = count_distinct_sorted(buf);
+                    for (int64_t k = lo; k < hi; ++k) slice[k - lo] = time_id[static_cast<std::size_t>(ucsr.rows[static_cast<std::size_t>(k)])];
+                    u_nper[static_cast<std::size_t>(u)] = count_distinct_sorted(slice, slice + (hi - lo));
                 }
                 if (cfg.has_mob) {
-                    buf.resize(static_cast<std::size_t>(hi - lo));
-                    for (int64_t k = lo; k < hi; ++k) buf[static_cast<std::size_t>(k - lo)] = mob_id[static_cast<std::size_t>(ucsr.rows[static_cast<std::size_t>(k)])];
-                    u_nmob[static_cast<std::size_t>(u)] = count_distinct_sorted(buf);
+                    for (int64_t k = lo; k < hi; ++k) slice[k - lo] = mob_id[static_cast<std::size_t>(ucsr.rows[static_cast<std::size_t>(k)])];
+                    u_nmob[static_cast<std::size_t>(u)] = count_distinct_sorted(slice, slice + (hi - lo));
                 }
             }
         }
@@ -799,7 +1251,7 @@ STDLL stata_call(int argc, char* argv[]) {
                 if (u_str[aa] != u_str[bb]) return u_str[aa] < u_str[bb];
                 return u_nmob[aa] < u_nmob[bb];
             };
-            std::sort(ord.begin(), ord.end(), less);
+            XSF_PARALLEL_SORT(ord.begin(), ord.end(), less);
             std::vector<int32_t> ns(static_cast<std::size_t>(U), 0);
             int64_t next = -1;
             for (std::size_t k = 0; k < ord.size(); ++k) {
@@ -844,18 +1296,27 @@ STDLL stata_call(int argc, char* argv[]) {
             }
         }
 
+        // eligible units by final stratum
+        const Csr fcsr = build_csr_parallel(u_fs, SF, &u_elig, ts);
         std::vector<int64_t> fs_n(static_cast<std::size_t>(SF), 0);
+        for (int64_t s = 0; s < SF; ++s) {
+            fs_n[static_cast<std::size_t>(s)] = fcsr.off[static_cast<std::size_t>(s) + 1] - fcsr.off[static_cast<std::size_t>(s)];
+        }
         int64_t U_elig = 0, U_movers_elig = 0, N_inelig = 0, U_inelig = 0;
-        for (int64_t u = 0; u < U; ++u) {
-            const std::size_t uu = static_cast<std::size_t>(u);
-            if (u_nobs[uu] <= 0) continue;
-            if (u_elig[uu]) {
-                ++U_elig;
-                ++fs_n[static_cast<std::size_t>(u_fs[uu])];
-                if (cfg.has_mob && u_nmob[uu] >= 2) ++U_movers_elig;
-            } else {
-                ++U_inelig;
-                N_inelig += u_nobs[uu];
+#pragma omp parallel
+        {
+            observe_team(ts);
+#pragma omp for schedule(static) reduction(+ : U_elig, U_movers_elig, N_inelig, U_inelig)
+            for (int64_t u = 0; u < U; ++u) {
+                const std::size_t uu = static_cast<std::size_t>(u);
+                if (u_nobs[uu] <= 0) continue;
+                if (u_elig[uu]) {
+                    ++U_elig;
+                    if (cfg.has_mob && u_nmob[uu] >= 2) ++U_movers_elig;
+                } else {
+                    ++U_inelig;
+                    N_inelig += u_nobs[uu];
+                }
             }
         }
         std::vector<int64_t> fs_k(static_cast<std::size_t>(SF), 0);
@@ -890,28 +1351,81 @@ STDLL stata_call(int argc, char* argv[]) {
             int64_t lcc_rows = 0, lcc_units = 0, lcc_mobs = 0;
             int32_t lcc_root = -1;
         };
-        // One pass over the rows builds the graph and the per-unit row counts;
-        // everything else is aggregated over units and mobility values.
+        // The distinct links of the masked rows: for every unit, its number of
+        // masked rows and the sorted distinct mobility values of those rows
+        // (CSR over units). Built in parallel, each unit writing only its own
+        // slots; both the graph and the movers per mobility value are computed
+        // from it, with one union per distinct link instead of one per row.
+        std::vector<int64_t> lk_rows, lk_off;
+        std::vector<int32_t> lk_mob;
+        std::vector<int32_t>& lk_scratch = row_scratch;
+        auto build_links = [&](const std::vector<uint8_t>& rowmask) {
+            lk_rows.assign(static_cast<std::size_t>(U), 0);
+            lk_off.assign(static_cast<std::size_t>(U) + 1, 0);
+#pragma omp parallel
+            {
+                observe_team(ts);
+#pragma omp for schedule(dynamic, 1024)
+                for (int64_t u = 0; u < U; ++u) {
+                    const std::size_t uu = static_cast<std::size_t>(u);
+                    const int64_t lo = ucsr.off[uu];
+                    const int64_t hi = ucsr.off[uu + 1];
+                    int64_t rows = 0;
+                    int64_t d = 0;
+                    for (int64_t k = lo; k < hi; ++k) {
+                        const int32_t row = ucsr.rows[static_cast<std::size_t>(k)];
+                        if (!rowmask[static_cast<std::size_t>(row)]) continue;
+                        ++rows;
+                        const int32_t m = mob_id[static_cast<std::size_t>(row)];
+                        if (m >= 0) lk_scratch[static_cast<std::size_t>(lo + d++)] = m;
+                    }
+                    auto first = lk_scratch.begin() + static_cast<std::ptrdiff_t>(lo);
+                    auto last = first + static_cast<std::ptrdiff_t>(d);
+                    std::sort(first, last);
+                    lk_rows[uu] = rows;
+                    lk_off[uu + 1] = std::unique(first, last) - first;
+                }
+            }
+            for (int64_t u = 0; u < U; ++u) lk_off[static_cast<std::size_t>(u) + 1] += lk_off[static_cast<std::size_t>(u)];
+            lk_mob.resize(static_cast<std::size_t>(lk_off[static_cast<std::size_t>(U)]));
+#pragma omp parallel
+            {
+                observe_team(ts);
+#pragma omp for schedule(static)
+                for (int64_t u = 0; u < U; ++u) {
+                    const std::size_t uu = static_cast<std::size_t>(u);
+                    const int64_t d = lk_off[uu + 1] - lk_off[uu];
+                    const int64_t src = ucsr.off[uu];
+                    for (int64_t k = 0; k < d; ++k) {
+                        lk_mob[static_cast<std::size_t>(lk_off[uu] + k)] = lk_scratch[static_cast<std::size_t>(src + k)];
+                    }
+                }
+            }
+        };
         std::vector<int64_t> g_urows, g_crows;
         std::vector<int32_t> g_uroot;
         std::vector<uint8_t> g_mseen;
+        // Components of the links last built (and of the groups of the masked
+        // rows): the union order does not matter, since every root is the
+        // smallest node of its component.
         auto analyse_graph = [&](const std::vector<uint8_t>& rowmask, UnionFind& uf,
                                  std::vector<uint8_t>* lcc_unit_flag) {
-            g_urows.assign(static_cast<std::size_t>(U), 0);
+            g_urows = lk_rows;
             g_crows.assign(static_cast<std::size_t>(U + M), 0);
             g_mseen.assign(static_cast<std::size_t>(M), 0);
-            std::vector<int32_t> gfirst;
-            if (cfg.has_group) gfirst.assign(static_cast<std::size_t>(G), -1);
-            for (int64_t i = 0; i < n; ++i) {
-                const std::size_t ii = static_cast<std::size_t>(i);
-                if (!rowmask[ii]) continue;
-                const int32_t u = unit_id[ii];
-                ++g_urows[static_cast<std::size_t>(u)];
-                if (mob_id[ii] >= 0) {
-                    g_mseen[static_cast<std::size_t>(mob_id[ii])] = 1;
-                    uf.unite(u, static_cast<int32_t>(U + mob_id[ii]));
+            for (int64_t u = 0; u < U; ++u) {
+                for (int64_t k = lk_off[static_cast<std::size_t>(u)]; k < lk_off[static_cast<std::size_t>(u) + 1]; ++k) {
+                    const int32_t m = lk_mob[static_cast<std::size_t>(k)];
+                    g_mseen[static_cast<std::size_t>(m)] = 1;
+                    uf.unite(static_cast<int32_t>(u), static_cast<int32_t>(U + m));
                 }
-                if (cfg.has_group && group_id[ii] >= 0) {
+            }
+            if (cfg.has_group) {
+                std::vector<int32_t> gfirst(static_cast<std::size_t>(G), -1);
+                for (int64_t i = 0; i < n; ++i) {
+                    const std::size_t ii = static_cast<std::size_t>(i);
+                    if (!rowmask[ii] || group_id[ii] < 0) continue;
+                    const int32_t u = unit_id[ii];
                     int32_t& f = gfirst[static_cast<std::size_t>(group_id[ii])];
                     if (f < 0) f = u;
                     else uf.unite(u, f);
@@ -964,41 +1478,25 @@ STDLL stata_call(int argc, char* argv[]) {
         // inflates Var(psi) (Bonhomme, Lamadon and Manresa, JEP 2026). Over
         // the masked rows a unit is a mover when it is linked to two or more
         // distinct mobility values, and every mobility value present counts
-        // the distinct mover units linked to it.
+        // the distinct mover units linked to it. Computed from the links last
+        // built.
         struct MobStats {
             int64_t values = 0;  // mobility values present in the mask
             int64_t weak = 0;    // values linked to at most one mover
             double mean_movers = 0.0;
         };
-        std::vector<int32_t> mob_nmob;               // per unit, inside the mask
         std::vector<int32_t> mob_movers, mob_units;  // per mobility value
-        std::vector<int32_t> mob_buf;
-        auto analyse_mobility = [&](const std::vector<uint8_t>& rowmask) {
-            mob_nmob.assign(static_cast<std::size_t>(U), 0);
+        auto analyse_mobility = [&]() {
             mob_movers.assign(static_cast<std::size_t>(M), 0);
             mob_units.assign(static_cast<std::size_t>(M), 0);
-            // the frame rows are already grouped by unit, so the distinct
-            // links are found with one small sort per unit
             for (int64_t u = 0; u < U; ++u) {
-                const std::size_t uu = static_cast<std::size_t>(u);
-                const int64_t lo = ucsr.off[uu];
-                const int64_t hi = ucsr.off[uu + 1];
-                mob_buf.clear();
+                const int64_t lo = lk_off[static_cast<std::size_t>(u)];
+                const int64_t hi = lk_off[static_cast<std::size_t>(u) + 1];
+                const bool mover = (hi - lo) >= 2;
                 for (int64_t k = lo; k < hi; ++k) {
-                    const int32_t row = ucsr.rows[static_cast<std::size_t>(k)];
-                    if (!rowmask[static_cast<std::size_t>(row)]) continue;
-                    if (mob_id[static_cast<std::size_t>(row)] < 0) continue;
-                    mob_buf.push_back(mob_id[static_cast<std::size_t>(row)]);
-                }
-                if (mob_buf.empty()) continue;
-                std::sort(mob_buf.begin(), mob_buf.end());
-                mob_buf.erase(std::unique(mob_buf.begin(), mob_buf.end()), mob_buf.end());
-                const int32_t d = static_cast<int32_t>(mob_buf.size());
-                mob_nmob[uu] = d;
-                for (const int32_t m : mob_buf) {
-                    const std::size_t mm = static_cast<std::size_t>(m);
+                    const std::size_t mm = static_cast<std::size_t>(lk_mob[static_cast<std::size_t>(k)]);
                     ++mob_units[mm];
-                    if (d >= 2) ++mob_movers[mm];
+                    if (mover) ++mob_movers[mm];
                 }
             }
             MobStats ms;
@@ -1015,30 +1513,34 @@ STDLL stata_call(int argc, char* argv[]) {
             return ms;
         };
 
-        // the graph passes cost a full union-find over the rows, so they run
-        // only when their result is asked for
+        // the graph passes cost a union-find over the distinct links, so they
+        // run only when their result is asked for
         const bool diag = cfg.connectivity || cfg.reconnect || cfg.connected || cfg.minmovers >= 0;
-        // the movers per mobility value cost one more pass over the frame rows,
-        // so connected and reconnect, which only need the components, do not pay
-        // for them: they are computed for connectivity and for minmovers()
+        // the movers per mobility value are computed for connectivity and for
+        // minmovers(); connected and reconnect only need the components
         const bool mobdiag = cfg.connectivity || cfg.minmovers >= 0;
         CompStats frame_cs;
         MobStats frame_ms;
         std::vector<uint8_t> u_lcc_frame;
         if (diag && cfg.has_mob && n_frame > 0) {
             std::vector<uint8_t> rowmask(static_cast<std::size_t>(n), 0);
-            for (int64_t i = 0; i < n; ++i) {
-                const std::size_t ii = static_cast<std::size_t>(i);
-                rowmask[ii] = (frame[ii] && u_elig[static_cast<std::size_t>(unit_id[ii])]) ? 1 : 0;
+#pragma omp parallel
+            {
+                observe_team(ts);
+#pragma omp for schedule(static)
+                for (int64_t i = 0; i < n; ++i) {
+                    const std::size_t ii = static_cast<std::size_t>(i);
+                    rowmask[ii] = (frame[ii] && u_elig[static_cast<std::size_t>(unit_id[ii])]) ? 1 : 0;
+                }
             }
+            build_links(rowmask);
             UnionFind uf(U + M);
             frame_cs = analyse_graph(rowmask, uf, &u_lcc_frame);
-            if (mobdiag) frame_ms = analyse_mobility(rowmask);
+            if (mobdiag) frame_ms = analyse_mobility();
             timer.mark("frame connectivity");
         }
 
         // ---- selection: k_g smallest keys inside every final stratum --------
-        const Csr fcsr = build_csr(u_fs, SF, &u_elig);
         std::vector<int32_t> fs_units = fcsr.rows;  // mutable copy for nth_element
         std::vector<uint8_t> u_sel(static_cast<std::size_t>(U), 0);
         bool need_keys = false;
@@ -1055,30 +1557,37 @@ STDLL stata_call(int argc, char* argv[]) {
         std::vector<uint64_t> u_tie;
         if (cfg.has_unit && cfg.nu > 0 && U > 0) {
             u_tie.resize(static_cast<std::size_t>(U));
-            for (int64_t u = 0; u < U; ++u) {
-                const std::size_t uu = static_cast<std::size_t>(u);
-                u_tie[uu] = splitmix64(double_bits(u_raw[0][uu]) ^ splitmix64(static_cast<uint64_t>(u)));
+#pragma omp parallel
+            {
+                observe_team(ts);
+#pragma omp for schedule(static)
+                for (int64_t u = 0; u < U; ++u) {
+                    const std::size_t uu = static_cast<std::size_t>(u);
+                    u_tie[uu] = splitmix64(double_bits(key1[uu]) ^ splitmix64(static_cast<uint64_t>(u)));
+                }
             }
         }
+        // Unit mode orders by (first key, hash, rank), a strict total order.
+        // Observation mode orders here by (first key, row) and settles the
+        // ties on the first key at the boundary afterwards with the further
+        // columns, which gives the order (u1, u2, ..., row) of `sample`.
         auto key_less = [&](int32_t a, int32_t b) {
-            const std::size_t ra = static_cast<std::size_t>(key_row[static_cast<std::size_t>(a)]);
-            const std::size_t rb = static_cast<std::size_t>(key_row[static_cast<std::size_t>(b)]);
+            const std::size_t aa = static_cast<std::size_t>(a);
+            const std::size_t bb = static_cast<std::size_t>(b);
+            const double x = key1[aa];
+            const double y = key1[bb];
+            if (x != y) return x < y;
             if (cfg.has_unit) {
-                const double x = u_raw[0][ra];
-                const double y = u_raw[0][rb];
-                if (x != y) return x < y;
-                const uint64_t ha = u_tie[static_cast<std::size_t>(a)];
-                const uint64_t hb = u_tie[static_cast<std::size_t>(b)];
+                const uint64_t ha = u_tie[aa];
+                const uint64_t hb = u_tie[bb];
                 if (ha != hb) return ha < hb;
-                return a < b;
-            }
-            for (int c = 0; c < cfg.nu; ++c) {
-                const double x = u_raw[static_cast<std::size_t>(c)][ra];
-                const double y = u_raw[static_cast<std::size_t>(c)][rb];
-                if (x != y) return x < y;
             }
             return a < b;
         };
+        // observation mode: strata whose boundary key value is tied across it
+        std::vector<uint8_t> tie_open(static_cast<std::size_t>(SF), 0);
+        std::vector<double> tie_value(static_cast<std::size_t>(SF), 0.0);
+        const bool obs_ties = !cfg.has_unit && cfg.nu > 1;
 #pragma omp parallel
         {
             observe_team(ts);
@@ -1089,12 +1598,139 @@ STDLL stata_call(int argc, char* argv[]) {
                 const int64_t hi = fcsr.off[ss + 1];
                 const int64_t k = fs_k[ss];
                 if (k <= 0 || hi <= lo) continue;
+                if (k < hi - lo && hi - lo >= kBigStratum) continue;  // drawn below
                 auto first = fs_units.begin() + static_cast<std::ptrdiff_t>(lo);
                 auto last = fs_units.begin() + static_cast<std::ptrdiff_t>(hi);
                 if (k < hi - lo) {
                     std::nth_element(first, first + static_cast<std::ptrdiff_t>(k - 1), last, key_less);
+                    if (obs_ties) {
+                        const double t = key1[static_cast<std::size_t>(*(first + static_cast<std::ptrdiff_t>(k - 1)))];
+                        for (auto it = first + static_cast<std::ptrdiff_t>(k); it != last; ++it) {
+                            if (key1[static_cast<std::size_t>(*it)] == t) {
+                                tie_open[ss] = 1;
+                                tie_value[ss] = t;
+                                break;
+                            }
+                        }
+                    }
                 }
                 for (int64_t j = 0; j < k; ++j) u_sel[static_cast<std::size_t>(*(first + static_cast<std::ptrdiff_t>(j)))] = 1;
+            }
+        }
+        // Large strata, one at a time: a histogram of the first key over
+        // monotone buckets finds the bucket that holds the k-th smallest key;
+        // every unit of a lower bucket is drawn and that bucket is ranked
+        // exactly. The k smallest under a strict total order are one set, so
+        // the result is the one nth_element gives.
+        for (int64_t s = 0; s < SF; ++s) {
+            const std::size_t ss = static_cast<std::size_t>(s);
+            const int64_t lo = fcsr.off[ss];
+            const int64_t hi = fcsr.off[ss + 1];
+            const int64_t k = fs_k[ss];
+            if (k <= 0 || k >= hi - lo || hi - lo < kBigStratum) continue;
+            const int nthreads = effective_threads();
+            std::vector<int64_t> hist_t(static_cast<std::size_t>(nthreads) * kKeyBuckets, 0);
+#pragma omp parallel
+            {
+                observe_team(ts);
+                int64_t* local = hist_t.data() + static_cast<std::size_t>(thread_index()) * kKeyBuckets;
+#pragma omp for schedule(static)
+                for (int64_t j = lo; j < hi; ++j) {
+                    ++local[key_bucket(key1[static_cast<std::size_t>(fs_units[static_cast<std::size_t>(j)])])];
+                }
+            }
+            std::vector<int64_t> hist(static_cast<std::size_t>(kKeyBuckets), 0);
+            for (int t = 0; t < nthreads; ++t) {
+                for (int b = 0; b < kKeyBuckets; ++b) hist[static_cast<std::size_t>(b)] += hist_t[static_cast<std::size_t>(t) * kKeyBuckets + static_cast<std::size_t>(b)];
+            }
+            int64_t below = 0;
+            int pivot = 0;
+            while (below + hist[static_cast<std::size_t>(pivot)] < k) {
+                below += hist[static_cast<std::size_t>(pivot)];
+                ++pivot;
+            }
+            const int64_t need = k - below;  // 1 .. hist[pivot]
+            const int64_t len = hi - lo;
+            const int64_t nchunks = std::max<int64_t>(1, std::min<int64_t>(len, kChunks));
+            // two passes over fixed chunks: count the pivot bucket, then fill
+            std::vector<int64_t> at(static_cast<std::size_t>(nchunks) + 1, 0);
+#pragma omp parallel
+            {
+                observe_team(ts);
+#pragma omp for schedule(static)
+                for (int64_t c = 0; c < nchunks; ++c) {
+                    int64_t cnt = 0;
+                    for (int64_t j = lo + chunk_begin(len, nchunks, c); j < lo + chunk_begin(len, nchunks, c + 1); ++j) {
+                        const int32_t u = fs_units[static_cast<std::size_t>(j)];
+                        const int b = key_bucket(key1[static_cast<std::size_t>(u)]);
+                        if (b < pivot) u_sel[static_cast<std::size_t>(u)] = 1;
+                        else if (b == pivot) ++cnt;
+                    }
+                    at[static_cast<std::size_t>(c) + 1] = cnt;
+                }
+            }
+            for (int64_t c = 0; c < nchunks; ++c) at[static_cast<std::size_t>(c) + 1] += at[static_cast<std::size_t>(c)];
+            std::vector<int32_t> cand(static_cast<std::size_t>(at[static_cast<std::size_t>(nchunks)]));
+#pragma omp parallel
+            {
+                observe_team(ts);
+#pragma omp for schedule(static)
+                for (int64_t c = 0; c < nchunks; ++c) {
+                    int64_t w = at[static_cast<std::size_t>(c)];
+                    for (int64_t j = lo + chunk_begin(len, nchunks, c); j < lo + chunk_begin(len, nchunks, c + 1); ++j) {
+                        const int32_t u = fs_units[static_cast<std::size_t>(j)];
+                        if (key_bucket(key1[static_cast<std::size_t>(u)]) == pivot) cand[static_cast<std::size_t>(w++)] = u;
+                    }
+                }
+            }
+            std::nth_element(cand.begin(), cand.begin() + static_cast<std::ptrdiff_t>(need - 1), cand.end(), key_less);
+            for (int64_t r = 0; r < need; ++r) u_sel[static_cast<std::size_t>(cand[static_cast<std::size_t>(r)])] = 1;
+            if (obs_ties) {
+                const double t = key1[static_cast<std::size_t>(cand[static_cast<std::size_t>(need - 1)])];
+                for (std::size_t r = static_cast<std::size_t>(need); r < cand.size(); ++r) {
+                    if (key1[static_cast<std::size_t>(cand[r])] == t) {
+                        tie_open[ss] = 1;
+                        tie_value[ss] = t;
+                        break;
+                    }
+                }
+            }
+        }
+        // Observation mode, ties on the first key across the boundary: the
+        // tied units keep the number of places they took, which go to the
+        // smallest (u2, ..., u_nu, row). The further columns are read here,
+        // on this thread, for the tied rows only.
+        if (obs_ties) {
+            for (int64_t s = 0; s < SF; ++s) {
+                const std::size_t ss = static_cast<std::size_t>(s);
+                if (!tie_open[ss]) continue;
+                const double t = tie_value[ss];
+                std::vector<int32_t> tied;
+                int64_t taken = 0;
+                for (int64_t j = fcsr.off[ss]; j < fcsr.off[ss + 1]; ++j) {
+                    const int32_t u = fs_units[static_cast<std::size_t>(j)];
+                    if (key1[static_cast<std::size_t>(u)] != t) continue;
+                    tied.push_back(u);
+                    taken += u_sel[static_cast<std::size_t>(u)];
+                }
+                const std::size_t nt = tied.size();
+                const int ncol = cfg.nu - 1;
+                std::vector<double> further(nt * static_cast<std::size_t>(ncol));
+                for (std::size_t g = 0; g < nt; ++g) {
+                    const int obs_no = om.obs_no(key_row[static_cast<std::size_t>(tied[g])]);
+                    for (int c = 0; c < ncol; ++c) further[g * static_cast<std::size_t>(ncol) + static_cast<std::size_t>(c)] = read_cell(idx_u + 1 + c, obs_no);
+                }
+                std::vector<std::size_t> ord(nt);
+                for (std::size_t g = 0; g < nt; ++g) ord[g] = g;
+                std::sort(ord.begin(), ord.end(), [&](std::size_t a, std::size_t b) {
+                    for (int c = 0; c < ncol; ++c) {
+                        const double x = further[a * static_cast<std::size_t>(ncol) + static_cast<std::size_t>(c)];
+                        const double y = further[b * static_cast<std::size_t>(ncol) + static_cast<std::size_t>(c)];
+                        if (x != y) return x < y;
+                    }
+                    return tied[a] < tied[b];
+                });
+                for (std::size_t r = 0; r < nt; ++r) u_sel[static_cast<std::size_t>(tied[ord[r]])] = (static_cast<int64_t>(r) < taken) ? 1 : 0;
             }
         }
         int64_t U_sel = 0, U_movers_sel = 0;
@@ -1119,7 +1755,7 @@ STDLL stata_call(int argc, char* argv[]) {
         }
         int64_t G_kept = 0;
         if (cfg.has_group && n_frame > 0) {
-            const Csr gcsr = build_csr(group_id, G, &frame);
+            const Csr gcsr = build_csr_parallel(group_id, G, &frame, ts);
             std::vector<uint8_t> gkeep(static_cast<std::size_t>(G), 0);
 #pragma omp parallel
             {
@@ -1148,14 +1784,26 @@ STDLL stata_call(int argc, char* argv[]) {
             timer.mark("group closure");
         }
 
+        // rows of the retained sample inside the frame
+        auto sample_mask = [&](std::vector<uint8_t>& rowmask) {
+            rowmask.resize(static_cast<std::size_t>(n));
+#pragma omp parallel
+            {
+                observe_team(ts);
+#pragma omp for schedule(static)
+                for (int64_t i = 0; i < n; ++i) {
+                    const std::size_t ii = static_cast<std::size_t>(i);
+                    rowmask[ii] = (frame[ii] && keep[ii]) ? 1 : 0;
+                }
+            }
+        };
+
         // ---- reconnect: grow the sample's largest component to the target ----
         int64_t U_reconnected = 0, N_reconnected = 0;
         if (cfg.reconnect && n_frame > 0 && U > 0) {
-            std::vector<uint8_t> rowmask(static_cast<std::size_t>(n), 0);
-            for (int64_t i = 0; i < n; ++i) {
-                const std::size_t ii = static_cast<std::size_t>(i);
-                rowmask[ii] = (frame[ii] && keep[ii]) ? 1 : 0;
-            }
+            std::vector<uint8_t> rowmask;
+            sample_mask(rowmask);
+            build_links(rowmask);
             UnionFind uf(U + M);
             const CompStats cs0 = analyse_graph(rowmask, uf, nullptr);
             std::vector<int64_t> crows;
@@ -1203,8 +1851,8 @@ STDLL stata_call(int argc, char* argv[]) {
 
                 auto unit_key_less = [&](int32_t a, int32_t b) {
                     if (!u_tie.empty()) {
-                        const double x = u_raw[0][static_cast<std::size_t>(a)];
-                        const double y = u_raw[0][static_cast<std::size_t>(b)];
+                        const double x = key1[static_cast<std::size_t>(a)];
+                        const double y = key1[static_cast<std::size_t>(b)];
                         if (x != y) return x < y;
                         const uint64_t ha = u_tie[static_cast<std::size_t>(a)];
                         const uint64_t hb = u_tie[static_cast<std::size_t>(b)];
@@ -1212,89 +1860,103 @@ STDLL stata_call(int argc, char* argv[]) {
                     }
                     return a < b;
                 };
-                std::vector<uint8_t> in_front(static_cast<std::size_t>(U), 0);
-                std::vector<int32_t> front;
-                auto push_mob = [&](int64_t m) {
-                    for (int64_t k = moff[static_cast<std::size_t>(m)]; k < moff[static_cast<std::size_t>(m) + 1]; ++k) {
-                        const int32_t u = mu[static_cast<std::size_t>(k)].second;
-                        const std::size_t uu = static_cast<std::size_t>(u);
-                        if (cand[uu] && !in_front[uu]) {
-                            in_front[uu] = 1;
-                            front.push_back(u);
-                        }
-                    }
-                };
-                auto rebuild_front = [&]() {
-                    front.clear();
-                    std::fill(in_front.begin(), in_front.end(), 0);
+                // The values of every component of the sample graph. A component
+                // other than the largest never changes until it joins it, so the
+                // values that join the largest component with a pick are the
+                // pick's own values and the values of the components it merges:
+                // the frontier stays complete without rescanning the graph.
+                std::vector<int64_t> coff(static_cast<std::size_t>(U + M) + 1, 0);
+                std::vector<int32_t> vroot(static_cast<std::size_t>(M));
+                for (int64_t m = 0; m < M; ++m) {
+                    const int32_t r = uf.find(static_cast<int32_t>(U + m));
+                    vroot[static_cast<std::size_t>(m)] = r;
+                    ++coff[static_cast<std::size_t>(r) + 1];
+                }
+                for (int64_t x = 0; x < U + M; ++x) coff[static_cast<std::size_t>(x) + 1] += coff[static_cast<std::size_t>(x)];
+                std::vector<int32_t> cvals(static_cast<std::size_t>(M));
+                {
+                    std::vector<int64_t> at(coff.begin(), coff.end() - 1);
                     for (int64_t m = 0; m < M; ++m) {
-                        if (uf.find(static_cast<int32_t>(U + m)) == lcc) push_mob(m);
+                        cvals[static_cast<std::size_t>(at[static_cast<std::size_t>(vroot[static_cast<std::size_t>(m)])]++)] = static_cast<int32_t>(m);
                     }
-                };
+                }
                 std::vector<int32_t> roots;
-                auto roots_of = [&](int32_t u, bool& touches) {
-                    touches = false;
+                auto roots_of = [&](int32_t u) {
                     roots.clear();
                     for (int64_t k = uoff[static_cast<std::size_t>(u)]; k < uoff[static_cast<std::size_t>(u) + 1]; ++k) {
                         const int32_t r = uf.find(static_cast<int32_t>(U + um[static_cast<std::size_t>(k)].second));
-                        if (r == lcc) touches = true;
-                        else roots.push_back(r);
+                        if (r != lcc) roots.push_back(r);
                     }
                     std::sort(roots.begin(), roots.end());
                     roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
                 };
-                // Deterministic greedy over the frontier units that touch the
-                // largest component: recon_rule=gain takes the one that joins
-                // the most rows (ties by the unit's own key), recon_rule=key
-                // takes the smallest key, i.e. a random order of the frontier.
-                auto scan = [&]() {
-                    int32_t pick = -1;
-                    int64_t pick_gain = -1;
-                    for (std::size_t f = 0; f < front.size(); ++f) {
-                        const int32_t u = front[f];
-                        if (!cand[static_cast<std::size_t>(u)]) continue;
-                        bool touches = false;
-                        roots_of(u, touches);
-                        if (!touches) continue;
-                        if (cfg.recon_rule == ReconRule::Key) {
-                            if (pick < 0 || unit_key_less(u, pick)) pick = u;
-                            continue;
-                        }
-                        int64_t gain = u_nobs[static_cast<std::size_t>(u)];
-                        for (int32_t r : roots) gain += crows[static_cast<std::size_t>(r)];
-                        if (gain > pick_gain || (gain == pick_gain && pick >= 0 && unit_key_less(u, pick))) {
-                            pick_gain = gain;
-                            pick = u;
-                        }
-                    }
-                    return pick;
+                // rows a unit joins to the largest component: its own and those
+                // of every other component it touches
+                auto gain_of = [&](int32_t u) {
+                    roots_of(u);
+                    int64_t g = u_nobs[static_cast<std::size_t>(u)];
+                    for (const int32_t r : roots) g += crows[static_cast<std::size_t>(r)];
+                    return g;
                 };
-                rebuild_front();
-                bool refreshed = true;
-                while (total > 0 && static_cast<double>(best) < target * static_cast<double>(total)) {
-                    int32_t pick = scan();
-                    if (pick < 0) {
-                        if (refreshed) break;
-                        rebuild_front();
-                        refreshed = true;
-                        pick = scan();
-                        if (pick < 0) break;
+                // The frontier is a heap: recon_rule=gain on (gain, key), where a
+                // stale gain is recomputed when it reaches the top (gains never
+                // grow, since a touched component can only join the largest one,
+                // so the top after recomputation is the true maximum);
+                // recon_rule=key on the key alone.
+                struct Entry {
+                    int64_t gain;
+                    int32_t u;
+                };
+                const bool by_gain = (cfg.recon_rule == ReconRule::Gain);
+                auto worse = [&](const Entry& a, const Entry& b) {
+                    if (by_gain && a.gain != b.gain) return a.gain < b.gain;
+                    return unit_key_less(b.u, a.u);
+                };
+                std::vector<Entry> heap;
+                std::vector<uint8_t> in_front(static_cast<std::size_t>(U), 0);
+                auto push_value = [&](int32_t m) {
+                    for (int64_t k = moff[static_cast<std::size_t>(m)]; k < moff[static_cast<std::size_t>(m) + 1]; ++k) {
+                        const int32_t u = mu[static_cast<std::size_t>(k)].second;
+                        const std::size_t uu = static_cast<std::size_t>(u);
+                        if (!cand[uu] || in_front[uu]) continue;
+                        in_front[uu] = 1;
+                        heap.push_back({by_gain ? gain_of(u) : 0, u});
+                        std::push_heap(heap.begin(), heap.end(), worse);
                     }
+                };
+                for (int64_t k = coff[static_cast<std::size_t>(lcc)]; k < coff[static_cast<std::size_t>(lcc) + 1]; ++k) {
+                    push_value(cvals[static_cast<std::size_t>(k)]);
+                }
+                std::vector<int32_t> merged;
+                while (total > 0 && static_cast<double>(best) < target * static_cast<double>(total)) {
+                    int32_t pick = -1;
+                    while (!heap.empty()) {
+                        std::pop_heap(heap.begin(), heap.end(), worse);
+                        const Entry top = heap.back();
+                        heap.pop_back();
+                        if (by_gain) {
+                            const int64_t g = gain_of(top.u);
+                            if (g < top.gain) {
+                                heap.push_back({g, top.u});
+                                std::push_heap(heap.begin(), heap.end(), worse);
+                                continue;
+                            }
+                        }
+                        pick = top.u;
+                        break;
+                    }
+                    if (pick < 0) break;
                     const std::size_t pp = static_cast<std::size_t>(pick);
-                    bool touches = false;
-                    roots_of(pick, touches);
+                    roots_of(pick);
+                    merged = roots;
                     int64_t sum = crows[static_cast<std::size_t>(lcc)] + u_nobs[pp];
                     crows[static_cast<std::size_t>(lcc)] = 0;
-                    for (int32_t r : roots) {
+                    for (const int32_t r : merged) {
                         sum += crows[static_cast<std::size_t>(r)];
                         crows[static_cast<std::size_t>(r)] = 0;
                     }
-                    const int64_t lo = ucsr.off[pp];
-                    const int64_t hi = ucsr.off[pp + 1];
-                    for (int64_t k = lo; k < hi; ++k) {
-                        const int32_t row = ucsr.rows[static_cast<std::size_t>(k)];
-                        keep[static_cast<std::size_t>(row)] = 1;
-                        rowmask[static_cast<std::size_t>(row)] = 1;
+                    for (int64_t k = ucsr.off[pp]; k < ucsr.off[pp + 1]; ++k) {
+                        keep[static_cast<std::size_t>(ucsr.rows[static_cast<std::size_t>(k)])] = 1;
                     }
                     for (int64_t k = uoff[pp]; k < uoff[pp + 1]; ++k) {
                         uf.unite(pick, static_cast<int32_t>(U + um[static_cast<std::size_t>(k)].second));
@@ -1304,11 +1966,14 @@ STDLL stata_call(int argc, char* argv[]) {
                     best = sum;
                     total += u_nobs[pp];
                     cand[pp] = 0;
-                    urows[pp] = u_nobs[pp];
                     ++U_reconnected;
                     N_reconnected += u_nobs[pp];
-                    for (int64_t k = uoff[pp]; k < uoff[pp + 1]; ++k) push_mob(um[static_cast<std::size_t>(k)].second);
-                    refreshed = false;
+                    for (int64_t k = uoff[pp]; k < uoff[pp + 1]; ++k) push_value(um[static_cast<std::size_t>(k)].second);
+                    for (const int32_t r : merged) {
+                        for (int64_t k = coff[static_cast<std::size_t>(r)]; k < coff[static_cast<std::size_t>(r) + 1]; ++k) {
+                            push_value(cvals[static_cast<std::size_t>(k)]);
+                        }
+                    }
                 }
             }
             timer.mark("reconnect");
@@ -1324,60 +1989,81 @@ STDLL stata_call(int argc, char* argv[]) {
         int64_t n_components = 0;
         int64_t N_minmovers_dropped = 0, U_minmovers_dropped = 0, prune_iters = 0;
         if ((cfg.connected || cfg.minmovers >= 0) && n_frame > 0) {
-            std::vector<uint8_t> rowmask(static_cast<std::size_t>(n), 0);
+            std::vector<uint8_t> rowmask;
             std::vector<uint8_t> drop_unit(static_cast<std::size_t>(U), 0);
             bool first_components = true;
+            // drop the masked rows of the units flagged in drop_unit
+            auto drop_flagged = [&]() {
+                int64_t dropped = 0;
+#pragma omp parallel
+                {
+                    observe_team(ts);
+#pragma omp for schedule(dynamic, 1024) reduction(+ : dropped)
+                    for (int64_t u = 0; u < U; ++u) {
+                        const std::size_t uu = static_cast<std::size_t>(u);
+                        if (!drop_unit[uu]) continue;
+                        for (int64_t k = ucsr.off[uu]; k < ucsr.off[uu + 1]; ++k) {
+                            const std::size_t row = static_cast<std::size_t>(ucsr.rows[static_cast<std::size_t>(k)]);
+                            if (!rowmask[row]) continue;
+                            keep[row] = 0;
+                            ++dropped;
+                        }
+                    }
+                }
+                return dropped;
+            };
             while (true) {
                 bool changed = false;
                 if (cfg.minmovers >= 0) {
-                    for (int64_t i = 0; i < n; ++i) {
-                        const std::size_t ii = static_cast<std::size_t>(i);
-                        rowmask[ii] = (frame[ii] && keep[ii]) ? 1 : 0;
-                    }
-                    analyse_mobility(rowmask);
-                    std::fill(drop_unit.begin(), drop_unit.end(), 0);
+                    sample_mask(rowmask);
+                    build_links(rowmask);
+                    analyse_mobility();
                     int64_t weak_units = 0;
-                    for (int64_t i = 0; i < n; ++i) {
-                        const std::size_t ii = static_cast<std::size_t>(i);
-                        if (!rowmask[ii] || mob_id[ii] < 0) continue;
-                        if (mob_movers[static_cast<std::size_t>(mob_id[ii])] >= cfg.minmovers) continue;
-                        uint8_t& d = drop_unit[static_cast<std::size_t>(unit_id[ii])];
-                        if (!d) {
-                            d = 1;
-                            ++weak_units;
+#pragma omp parallel
+                    {
+                        observe_team(ts);
+#pragma omp for schedule(static) reduction(+ : weak_units)
+                        for (int64_t u = 0; u < U; ++u) {
+                            const std::size_t uu = static_cast<std::size_t>(u);
+                            uint8_t weak = 0;
+                            for (int64_t k = lk_off[uu]; k < lk_off[uu + 1]; ++k) {
+                                if (mob_movers[static_cast<std::size_t>(lk_mob[static_cast<std::size_t>(k)])] < cfg.minmovers) {
+                                    weak = 1;
+                                    break;
+                                }
+                            }
+                            drop_unit[uu] = weak;
+                            weak_units += weak;
                         }
                     }
                     if (weak_units > 0) {
-                        for (int64_t i = 0; i < n; ++i) {
-                            const std::size_t ii = static_cast<std::size_t>(i);
-                            if (!rowmask[ii]) continue;
-                            if (!drop_unit[static_cast<std::size_t>(unit_id[ii])]) continue;
-                            keep[ii] = 0;
-                            ++N_minmovers_dropped;
-                        }
+                        N_minmovers_dropped += drop_flagged();
                         U_minmovers_dropped += weak_units;
                         changed = true;
                     }
                 }
                 if (cfg.connected) {
-                    for (int64_t i = 0; i < n; ++i) {
-                        const std::size_t ii = static_cast<std::size_t>(i);
-                        rowmask[ii] = (frame[ii] && keep[ii]) ? 1 : 0;
-                    }
+                    sample_mask(rowmask);
+                    build_links(rowmask);
                     UnionFind uf(U + M);
                     const CompStats cs = analyse_graph(rowmask, uf, nullptr);
                     if (first_components) {
                         n_components = cs.ncomp;
                         first_components = false;
                     }
-                    for (int64_t i = 0; i < n; ++i) {
-                        const std::size_t ii = static_cast<std::size_t>(i);
-                        if (!rowmask[ii]) continue;
-                        if (uf.find(unit_id[ii]) != cs.lcc_root) {
-                            keep[ii] = 0;
-                            ++N_connected_dropped;
-                            changed = true;
+#pragma omp parallel
+                    {
+                        observe_team(ts);
+#pragma omp for schedule(static)
+                        for (int64_t u = 0; u < U; ++u) {
+                            const std::size_t uu = static_cast<std::size_t>(u);
+                            drop_unit[uu] = (g_uroot[uu] >= 0 && g_uroot[uu] != cs.lcc_root) ? 1 : 0;
                         }
+                    }
+                    const int64_t dropped = drop_flagged();
+                    if (dropped > 0) {
+                        N_connected_dropped += dropped;
+                        changed = true;
                     }
                 }
                 ++prune_iters;
@@ -1391,15 +2077,13 @@ STDLL stata_call(int argc, char* argv[]) {
         MobStats sample_ms;
         int64_t U_lcc_kept = 0;
         if (diag && cfg.has_mob && n_frame > 0) {
-            std::vector<uint8_t> rowmask(static_cast<std::size_t>(n), 0);
-            for (int64_t i = 0; i < n; ++i) {
-                const std::size_t ii = static_cast<std::size_t>(i);
-                rowmask[ii] = (frame[ii] && keep[ii]) ? 1 : 0;
-            }
+            std::vector<uint8_t> rowmask;
+            sample_mask(rowmask);
+            build_links(rowmask);
             UnionFind uf(U + M);
             std::vector<uint8_t> u_lcc_sample;
             sample_cs = analyse_graph(rowmask, uf, &u_lcc_sample);
-            if (mobdiag) sample_ms = analyse_mobility(rowmask);
+            if (mobdiag) sample_ms = analyse_mobility();
             for (int64_t u = 0; u < U; ++u) {
                 const std::size_t uu = static_cast<std::size_t>(u);
                 if (u_lcc_sample[uu] && !u_lcc_frame.empty() && u_lcc_frame[uu]) ++U_lcc_kept;
@@ -1412,33 +2096,69 @@ STDLL stata_call(int argc, char* argv[]) {
         std::vector<int64_t> u_retrows(static_cast<std::size_t>(U), 0);
         std::vector<uint8_t> m_ret(static_cast<std::size_t>(M), 0);
         std::vector<uint8_t> g_ret(static_cast<std::size_t>(G), 0);
-        for (int64_t i = 0; i < n; ++i) {
-            const std::size_t ii = static_cast<std::size_t>(i);
-            if (!frame[ii] || !keep[ii]) continue;
-            ++N_frame_retained;
-            ++u_retrows[static_cast<std::size_t>(unit_id[ii])];
-            if (cfg.has_mob && mob_id[ii] >= 0) m_ret[static_cast<std::size_t>(mob_id[ii])] = 1;
-            if (cfg.has_group) g_ret[static_cast<std::size_t>(group_id[ii])] = 1;
-        }
         int64_t U_ret = 0, U_ret_movers = 0, M_ret = 0, G_ret = 0;
         int64_t U_partial = 0, U_inelig_ret = 0;
-        for (int64_t u = 0; u < U; ++u) {
-            const std::size_t uu = static_cast<std::size_t>(u);
-            if (u_retrows[uu] <= 0) continue;
-            ++U_ret;
-            if (cfg.has_mob && u_nmob[uu] >= 2) ++U_ret_movers;
-            // group closure can retain part of a unit, or bring back a unit
-            // that the eligibility filters had dropped
-            if (u_retrows[uu] < u_nobs[uu]) ++U_partial;
-            if (!u_elig[uu]) ++U_inelig_ret;
+#pragma omp parallel
+        {
+            observe_team(ts);
+            // every frame row belongs to one unit, so the unit sums cover them
+#pragma omp for schedule(static) reduction(+ : N_frame_retained)
+            for (int64_t u = 0; u < U; ++u) {
+                const std::size_t uu = static_cast<std::size_t>(u);
+                int64_t cnt = 0;
+                for (int64_t k = ucsr.off[uu]; k < ucsr.off[uu + 1]; ++k) cnt += keep[static_cast<std::size_t>(ucsr.rows[static_cast<std::size_t>(k)])];
+                u_retrows[uu] = cnt;
+                N_frame_retained += cnt;
+            }
+#pragma omp for schedule(static)
+            for (int64_t i = 0; i < n; ++i) {
+                const std::size_t ii = static_cast<std::size_t>(i);
+                if (!frame[ii] || !keep[ii]) continue;
+                if (cfg.has_mob && mob_id[ii] >= 0) {
+                    const std::size_t mm = static_cast<std::size_t>(mob_id[ii]);
+                    uint8_t cur;
+#pragma omp atomic read
+                    cur = m_ret[mm];
+                    if (!cur) {
+#pragma omp atomic write
+                        m_ret[mm] = 1;
+                    }
+                }
+                if (cfg.has_group) {
+                    const std::size_t gg = static_cast<std::size_t>(group_id[ii]);
+                    uint8_t cur;
+#pragma omp atomic read
+                    cur = g_ret[gg];
+                    if (!cur) {
+#pragma omp atomic write
+                        g_ret[gg] = 1;
+                    }
+                }
+            }
+#pragma omp for schedule(static) reduction(+ : U_ret, U_ret_movers, U_partial, U_inelig_ret)
+            for (int64_t u = 0; u < U; ++u) {
+                const std::size_t uu = static_cast<std::size_t>(u);
+                if (u_retrows[uu] <= 0) continue;
+                ++U_ret;
+                if (cfg.has_mob && u_nmob[uu] >= 2) ++U_ret_movers;
+                // group closure can retain part of a unit, or bring back a unit
+                // that the eligibility filters had dropped
+                if (u_retrows[uu] < u_nobs[uu]) ++U_partial;
+                if (!u_elig[uu]) ++U_inelig_ret;
+            }
+#pragma omp for schedule(static) reduction(+ : M_ret)
+            for (int64_t m = 0; m < M; ++m) M_ret += m_ret[static_cast<std::size_t>(m)];
+#pragma omp for schedule(static) reduction(+ : G_ret)
+            for (int64_t g = 0; g < G; ++g) G_ret += g_ret[static_cast<std::size_t>(g)];
         }
-        for (int64_t m = 0; m < M; ++m) M_ret += m_ret[static_cast<std::size_t>(m)];
-        for (int64_t g = 0; g < G; ++g) G_ret += g_ret[static_cast<std::size_t>(g)];
 
         // ---- write output ---------------------------------------------------
+        // When the ado created the target as 0, only the retained rows are
+        // written; otherwise every row is.
         for (int64_t i = 0; i < n; ++i) {
             const std::size_t ii = static_cast<std::size_t>(i);
-            if (SF_vstore(idx_out, obs[ii], keep[ii] ? 1.0 : 0.0)) {
+            if (cfg.out_zero && !keep[ii]) continue;
+            if (SF_vstore(idx_out, om.obs_no(i), keep[ii] ? 1.0 : 0.0)) {
                 fail("failed to store the sample indicator");
             }
         }

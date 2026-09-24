@@ -208,8 +208,8 @@ the eligible frame and on the final sample: `r(N_components_frame)`,
 `r(lcc_mobility_share)` and `r(N_units_lcc_kept)`. It also reports the movers
 per mobility value, `r(movers_per_mob_frame)` and `r(movers_per_mob)`, and the
 share of mobility values with at most one mover, `r(weak_mob_share_frame)` and
-`r(weak_mob_share)`. It is opt-in — each graph costs a serial union-find over
-every frame row. `connected`, `reconnect` and `minmovers()` build the same
+`r(weak_mob_share)`. It is opt-in — each graph costs a pass over the frame rows
+and a union-find over their distinct unit-mobility links. `connected`, `reconnect` and `minmovers()` build the same
 graphs and report the components without the option; the movers per mobility
 value cost one further pass, so only `connectivity` and `minmovers()` compute
 them.
@@ -234,12 +234,12 @@ Measured on a 10% unit draw (`absorb(id1 id2)`,
 
 | dataset | 10% draw | after `reconnect` | added | mean mobility values per unit | movers |
 |---|---|---|---|---|---|
-| patents (500,008 rows, 101,837 units) | 50,241 rows, 10,184 units, largest component 0.8% | 106,639 rows, 15,518 units, 76.0% | 5,334 units / 56,398 rows | 4.91 (pop) / 4.93 -> 6.87 | 0.918 (pop) / 0.920 -> 0.947 |
-| synthetic-assortative (499,155 rows) | 49,446 rows, 12,610 units, 0.1% | 101,386 rows, 19,726 units, 69.0% | 7,116 units / 51,940 rows | 1.56 (pop) / 1.55 -> 1.98 | 0.403 (pop) / 0.399 -> 0.601 |
+| patents (500,008 rows, 101,837 units) | 50,241 rows, 10,184 units, largest component 0.8% | 99,315 rows, 14,626 units, 76.0% | 4,442 units / 49,074 rows | 4.91 (pop) / 4.93 -> 6.79 | 0.918 (pop) / 0.920 -> 0.944 |
+| synthetic-assortative (499,155 rows) | 49,446 rows, 12,610 units, 0.1% | 96,522 rows, 18,741 units, 69.0% | 6,131 units / 47,076 rows | 1.56 (pop) / 1.55 -> 1.97 | 0.403 (pop) / 0.399 -> 0.588 |
 | enron (367,662 rows) | 37,595 rows, 3,669 units, 96.2% | 63,462 rows, 3,704 units, 98.4% | 35 units / 25,867 rows | 10.02 (pop) / 10.25 -> 17.13 | 0.694 (pop) / 0.690 -> 0.693 |
 
 So a `#` percent request can come back at roughly twice `#` percent of the rows
-(2.1x on the first two, 1.7x on `enron` from only 35 hub units), with a higher
+(2.0x on the first two, 1.7x on `enron` from only 35 hub units), with a higher
 mean mobility and mover share; the population class shares are not preserved.
 `recontarget(#)` is the lever — a target below `r(lcc_share_frame)` stops the
 growth earlier.
@@ -249,18 +249,20 @@ growth earlier.
 
 | dataset | rule | rows | units (added) | mean mobility values per unit | movers | time |
 |---|---|---:|---|---:|---:|---:|
-| patents (pop 4.910, 0.918) | `gain` | 106,639 | 15,518 (+5,334) | 6.872 | 0.947 | 10.5 s |
-| | `key` | 124,331 | 22,304 (+12,120) | 5.574 | 0.951 | 16.0 s |
-| synthetic-assortative (pop 1.556, 0.403) | `gain` | 101,386 | 19,726 (+7,116) | 1.981 | 0.601 | 2.0 s |
-| | `key` | 114,629 | 26,863 (+14,253) | 1.802 | 0.542 | 4.1 s |
-| enron (pop 10.020, 0.694) | `gain` | 63,462 | 3,704 (+35) | 17.133 | 0.693 | 0.2 s |
-| | `key` | 66,517 | 6,241 (+2,572) | 10.658 | 0.711 | 4.2 s |
+| patents (pop 4.910, 0.918) | `gain` | 99,315 | 14,626 (+4,442) | 6.790 | 0.944 | 0.2 s |
+| | `key` | 123,679 | 22,346 (+12,162) | 5.535 | 0.951 | 0.2 s |
+| synthetic-assortative (pop 1.556, 0.403) | `gain` | 96,522 | 18,741 (+6,131) | 1.967 | 0.588 | 0.2 s |
+| | `key` | 114,199 | 26,807 (+14,197) | 1.791 | 0.539 | 0.2 s |
+| enron (pop 10.020, 0.694) | `gain` | 63,462 | 3,704 (+35) | 17.133 | 0.693 | 0.1 s |
+| | `key` | 66,536 | 6,246 (+2,577) | 10.653 | 0.711 | 0.2 s |
 
 `key` is closer to the population mean mobility on all three (most visibly on
-`enron`) and to its mover share on `synthetic-assortative`; `gain` gives 5-17%
-fewer rows and is faster (up to 20x on `enron`), and is slightly closer on the
-mover share of `patents` and `enron`. Neither dominates, so `gain` stays the
-default.
+`enron`) and to its mover share on `synthetic-assortative`; `gain` gives 5-20%
+fewer rows and is slightly closer on the mover share of `patents` and `enron`;
+both take well under a second here. Neither dominates, so `gain` stays the
+default. Since 1.3.0 the frontier is complete after every addition (earlier
+versions refreshed it only when it ran out), so these results differ from
+1.2.x.
 
 `reconnect` also ignores the `by()` strata: the units it adds come from the
 whole frontier, so the per-stratum counts stop being exact and
