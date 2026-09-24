@@ -130,5 +130,6 @@ four targets, ineligible units and missing mobility values), 1.3.0 agreed in
 every case and 1.2.3 differed in 42. On the benchmark datasets reconnect
 reaches the same target with fewer units under gain (4,442 instead of 5,334 on
 patents, 6,131 instead of 7,116 on synthetic-assortative, the same 35 on
-enron) and runs in well under a second instead of 2 to 20 seconds. Every other
+enron) and runs in well under a second, where 1.2.3 took up to 20 seconds
+(19.6 s to 0.2 s on patents with reconrule(key)). Every other
 stored result and every sample drawn without reconnect is identical to 1.2.3.
