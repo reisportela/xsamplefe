@@ -154,8 +154,9 @@ runtimes. It does not require MSYS2 or a compiler to run.
 
 For an optional source build:
 
-Native, in an MSYS2 **UCRT64** shell with `mingw-w64-ucrt-x86_64-gcc`, or a
-MINGW64 shell with `mingw-w64-x86_64-gcc`:
+Native, in an MSYS2 **UCRT64** shell with `mingw-w64-ucrt-x86_64-gcc` and
+`mingw-w64-ucrt-x86_64-libgomp`, or a MINGW64 shell with `mingw-w64-x86_64-gcc`
+and `mingw-w64-x86_64-libgomp` (recent MSYS2 packages ship OpenMP separately):
 
 ```bash
 bash stata/tools/build-xsamplefe-plugin.sh --windows
