@@ -268,3 +268,30 @@ corrections below.
   `[fweight]` with the `by` prefix. Section 13 adds the 48-thread, 10^9 and
   2^53 cases above. A string weight keeps Stata's own r(109) "type mismatch",
   which `syntax` raises before `xsamplefe` runs, as for any Stata command.
+
+## 1.4.1: a Linux plugin for Enterprise Linux 8 and Ubuntu 20.04
+
+Sampling is unchanged: the C++ source differs from 1.4.0 only in the release
+number that the plugin reports to the ado. The 1.4.0 Linux plugin, like 1.3.0,
+was built on AlmaLinux 9 with GCC 11 and imported `GLIBCXX_3.4.29` (for
+`std::__throw_bad_array_new_length`) from the system libstdc++. RHEL 8 ships the
+libstdc++ of GCC 8 (up to `GLIBCXX_3.4.25`) and Ubuntu 20.04 that of GCC 10 (up
+to `GLIBCXX_3.4.28`), so there the plugin did not load and Stata reported only
+that it could not be loaded; a user met this in an Ubuntu 20.04 container on a
+RHEL 8 host. The glibc requirement was 2.14.
+
+The release workflow now builds the Linux plugin on AlmaLinux 8 with
+`gcc-toolset-13`, whose libstdc++ parts newer than GCC 8 are linked statically;
+glibc, libstdc++, libgcc_s and libgomp remain the system's. The workflow fails
+if the plugin imports a symbol version above `GLIBC_2.28`, `GLIBCXX_3.4.25` or
+`CXXABI_1.3.11`, and packages the release only after the native plugin test
+loads the exact binary (`RTLD_NOW`) on AlmaLinux 8 and on Ubuntu 20.04 with each
+system's own runtime. Linking libstdc++ statically on AlmaLinux 9 was tried and
+rejected: the plugin then imported `GLIBC_2.34` (`pthread_once`,
+`__pthread_key_create`) and `GLIBC_2.32`, which Ubuntu 20.04 and RHEL 8 lack.
+
+The compiler changes from GCC 11 to GCC 13. The release procedure certifies the
+exact Linux binary from the workflow and compares its draws with the 1.4.0
+binary; the release notes record the result. When the plugin cannot be loaded
+on Linux, the ado now suggests `ldd`, which names the missing library or symbol
+version; the random-number state and the data are left as they were.

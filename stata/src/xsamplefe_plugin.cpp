@@ -76,7 +76,7 @@ constexpr const char* kPrefix = "xsamplefe plugin: ";
 // before anything else: a plugin loaded earlier in the Stata session stays in
 // use after net install, a rebuild or discard, and the ado refuses to run on
 // one of another release.
-constexpr const char* kPluginVersion = "10400";
+constexpr const char* kPluginVersion = "10401";
 
 [[noreturn]] void fail(const std::string& msg) {
     throw std::runtime_error(std::string(kPrefix) + msg);

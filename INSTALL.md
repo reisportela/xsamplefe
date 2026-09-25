@@ -102,15 +102,25 @@ script works offline and performs no downloads or software installations.
 
 ### Linux x86-64
 
-The release build uses AlmaLinux 9 and GCC 11 in GitHub Actions. Use an
-environment with glibc 2.34 or newer and GCC 11-compatible runtime libraries:
-`libgomp.so.1`, `libstdc++.so.6`, and `libgcc_s.so.1`. Check with:
+Since 1.4.1 the release build uses AlmaLinux 8 with `gcc-toolset-13` in GitHub
+Actions, whose newer C++ runtime parts are linked into the plugin. It needs
+glibc 2.28 and the libstdc++ of GCC 8 (`GLIBCXX_3.4.25`) or newer, plus the
+OpenMP runtime `libgomp.so.1` (package `libgomp` on RHEL-like systems,
+`libgomp1` on Debian and Ubuntu). The workflow rejects a binary above that
+floor and loads it on AlmaLinux 8 and Ubuntu 20.04; RHEL 8 and 9, Ubuntu 20.04
+and newer systems therefore qualify. Releases up to 1.4.0 were built on
+AlmaLinux 9 and needed the libstdc++ of GCC 11 (`GLIBCXX_3.4.29`): they do not
+load on RHEL 8 or Ubuntu 20.04.
+
+When Stata reports that `xsamplefe.plugin` could not be loaded, run `ldd` on
+the installed file (in Stata, `findfile xsamplefe.plugin` gives its path); a
+`not found` line names the missing library or symbol version:
 
 ```bash
-ldd stata/xsamplefe_linux64.plugin
+ldd ~/ado/plus/x/xsamplefe.plugin
 ```
 
-If a runtime is older, build from source with a C++17/OpenMP compiler on that
+On an older system, build from source with a C++17/OpenMP compiler on that
 machine; the script defaults to GCC:
 
 ```bash

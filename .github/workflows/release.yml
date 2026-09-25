@@ -10,7 +10,10 @@ jobs:
   native:
     name: Native ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
-    container: ${{ matrix.platform == 'linux64' && 'almalinux:9' || null }}
+    # Enterprise Linux 8 with gcc-toolset: the newer libstdc++ parts link
+    # statically, so the plugin needs only glibc 2.28 and GCC 8's libstdc++
+    # (1.4.0, built on AlmaLinux 9, did not load on RHEL 8 or Ubuntu 20.04).
+    container: ${{ matrix.platform == 'linux64' && 'almalinux:8' || null }}
     strategy:
       fail-fast: false
       matrix:
@@ -18,19 +21,22 @@ jobs:
           - platform: linux64
             os: ubuntu-22.04
             target: --linux
+            python: python3.11
           - platform: win64
             os: windows-2022
             target: --windows
           - platform: macintel64
             os: macos-15-intel
             target: --macos-intel
+            python: python3
           - platform: macarm64
             os: macos-14
             target: --macos-arm64
+            python: python3
     steps:
-      - name: Linux toolchain matching the validation host
+      - name: Linux toolchain with the Enterprise Linux 8 runtime
         if: matrix.platform == 'linux64'
-        run: dnf -y install gcc-c++ python3 git binutils
+        run: dnf -y install gcc-toolset-13-gcc-c++ python3.11 git binutils
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
@@ -53,17 +59,29 @@ jobs:
           OMP_NUM_THREADS: 2
           PLATFORM: ${{ matrix.platform }}
           BUILD_TARGET: ${{ matrix.target }}
+          PYTHON: ${{ matrix.python }}
         run: |
           set -euo pipefail
+          if [[ "$PLATFORM" == linux64 ]]; then source /opt/rh/gcc-toolset-13/enable; fi
           bash stata/tools/build-xsamplefe-plugin.sh "$BUILD_TARGET" --openmp --no-march-native
-          python3 stata/tools/prepare-platform-assets.py --platform "$PLATFORM" --output out
+          "$PYTHON" stata/tools/prepare-platform-assets.py --platform "$PLATFORM" --output out
           if [[ "$PLATFORM" == linux64 ]]; then
+            # fail closed above the Enterprise Linux 8 floor (GCC 8 libstdc++)
+            versions="$(LC_ALL=C readelf --dyn-syms --wide out/xsamplefe_linux64.plugin | grep -oE '@(GLIBC|GLIBCXX|CXXABI)_[0-9.]+' | sort -u || true)"
+            [[ -n "$versions" ]] || { echo "no versioned imports found in the Linux plugin" >&2; exit 1; }
+            for floor in GLIBC_2.28 GLIBCXX_3.4.25 CXXABI_1.3.11; do
+              top="$(grep -oE "@${floor%_*}_[0-9.]+" <<<"$versions" | sed "s/@${floor%_*}_//" | sort -V | tail -1 || true)"
+              if [[ -n "$top" && "$(printf '%s\n' "$top" "${floor##*_}" | sort -V | tail -1)" != "${floor##*_}" ]]; then
+                echo "the Linux plugin requires ${floor%_*}_${top}, above ${floor}" >&2; exit 1
+              fi
+              echo "${floor%_*} <= ${top:-none} (floor ${floor##*_})"
+            done
             g++ -std=c++17 -O2 -DSYSTEM=OPUNIX -Istata/tools/_deps tests/plugin_smoke.cpp -ldl -o out/plugin_smoke
           else
             clang++ -std=c++17 -O2 -DSYSTEM=APPLEMAC -Istata/tools/_deps tests/plugin_smoke.cpp -o out/plugin_smoke
           fi
           out/plugin_smoke "$PWD/out/xsamplefe_${PLATFORM}.plugin" | tee out/native_spi.txt
-          python3 tests/test_build_script.py
+          "$PYTHON" tests/test_build_script.py
       - name: Build and test Windows plugin
         if: matrix.platform == 'win64'
         shell: msys2 {0}
@@ -86,8 +104,38 @@ jobs:
             out/*_build.json
             out/native_spi.txt
           if-no-files-found: error
-  package:
+  linux-runtime:
+    name: Linux plugin on ${{ matrix.image }}
     needs: native
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: almalinux:8
+            install: dnf -y -q install gcc-c++
+          - image: ubuntu:20.04
+            install: apt-get -qq update && DEBIAN_FRONTEND=noninteractive apt-get -y -qq install g++
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: xsamplefe-linux64
+          path: native
+      - name: Load the exact plugin with the distribution's own runtime
+        env:
+          IMAGE: ${{ matrix.image }}
+          INSTALL: ${{ matrix.install }}
+        run: |
+          docker run --rm -v "$PWD:/w:ro" -w /w -e INSTALL "$IMAGE" bash -c '
+            set -euo pipefail
+            eval "$INSTALL" >/dev/null
+            g++ -std=c++17 -O2 -DSYSTEM=OPUNIX -Istata/tools/_deps tests/plugin_smoke.cpp -ldl -o /tmp/plugin_smoke
+            /tmp/plugin_smoke /w/native/xsamplefe_linux64.plugin'
+  package:
+    needs: [native, linux-runtime]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
