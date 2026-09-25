@@ -35,13 +35,14 @@ class BuildPlanTests(unittest.TestCase):
         self.assertEqual(cmd[0], "g++")
         self.assertIn("-DSYSTEM=OPUNIX", cmd)
         self.assertIn("-fopenmp", cmd)
+        self.assertIn("-ffp-contract=off", cmd)
         self.assertTrue(cmd[-1].endswith("xsamplefe_linux64.plugin"))
         self.assertNotIn("-march=native", cmd)
 
     def test_windows_has_static_runtimes(self):
         cmd = self.plan("--windows", env={"CXX": "x86_64-w64-mingw32-g++"})
         for flag in ["-DSYSTEM=STWIN32", "-std=gnu++17", "-m64", "-static",
-                     "-static-libgcc", "-static-libstdc++", "-fopenmp"]:
+                     "-static-libgcc", "-static-libstdc++", "-fopenmp", "-ffp-contract=off"]:
             self.assertIn(flag, cmd)
         self.assertTrue(any(x.endswith("mingw_stdio_shim.h") for x in cmd))
         self.assertTrue(cmd[-1].endswith("xsamplefe_win64.plugin"))
@@ -56,6 +57,7 @@ class BuildPlanTests(unittest.TestCase):
                 cmd = self.plan(option, env={variable: prefix})
                 self.assertEqual(cmd[cmd.index("-arch") + 1], arch)
                 self.assertIn("-DSYSTEM=APPLEMAC", cmd)
+                self.assertIn("-ffp-contract=off", cmd)
                 self.assertIn("-bundle", cmd)
                 self.assertIn("-Xpreprocessor", cmd)
                 self.assertIn(prefix + "/lib/libomp.dylib", cmd)

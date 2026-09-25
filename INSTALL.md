@@ -12,6 +12,9 @@ help xsamplefe
 
 The URL follows the latest stable release; it is not tied to a version number.
 Stata selects the correct binary automatically. No compilation is needed.
+When updating a Stata session in which `xsamplefe` has already run, restart
+Stata after `net install`: `discard` reloads the ado-file but not the plugin,
+and `xsamplefe` refuses to run on a plugin of another release (r(498)).
 The release includes Linux x86-64, Windows x86-64, Mac Intel and Mac ARM plugins,
 built and tested through the plugin interface on their native GitHub runners.
 Actual Stata validation is currently on Linux (StataNow/MP 19.5); the minimum
@@ -73,7 +76,10 @@ discard
 ```
 
 `xsamplefe` loads `xsamplefe.plugin` from the same folder as `xsamplefe.ado`.
-After replacing the plugin in a running session type `discard`.
+A plugin stays loaded until Stata exits, so after replacing it in a session
+where `xsamplefe` has run, restart Stata (`discard` reloads only the ado-file).
+Never copy a plugin over the file a running Stata has loaded, which can crash
+Stata; the build script and `net install` write a new file instead.
 
 The descriptor refuses installation when the required platform binary is absent.
 The ZIP does not include Stata or compilers. On Windows, use forward slashes

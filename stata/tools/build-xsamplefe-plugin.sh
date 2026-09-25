@@ -119,7 +119,8 @@ if [[ -z "$OUT_PLUGIN" ]]; then OUT_PLUGIN="${STATA_DIR}/xsamplefe_${PLATFORM}.p
 [[ "$OUT_PLUGIN" == /* ]] || OUT_PLUGIN="${PWD}/${OUT_PLUGIN}"
 [[ "$OUT_PLUGIN" == *.plugin ]] || fail "--output must name a .plugin file"
 
-compile_flags=( -std=c++17 -O3 -DNDEBUG "-DSYSTEM=${SYSTEM_DEF}" -I"${DEPS_DIR}" )
+# -ffp-contract=off: no fused multiply-add, so double arithmetic rounds as in Stata on every target
+compile_flags=( -std=c++17 -O3 -DNDEBUG -ffp-contract=off "-DSYSTEM=${SYSTEM_DEF}" -I"${DEPS_DIR}" )
 link_flags=( "$LINK_MODE" )
 case "$TARGET" in
   linux) compile_flags+=( -m64 -fPIC -pthread ); link_flags+=( -pthread ) ;;

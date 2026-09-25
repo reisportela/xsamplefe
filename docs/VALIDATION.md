@@ -14,15 +14,19 @@ that never starts Stata cannot produce a successful verdict.
 Coverage includes:
 
 - Exact retained rows and RNG state against native `sample`, including a
-  140-case grid and counts larger than signed 64-bit integers.
+  140-case grid, sizes and percentages whose product n·#/100 lands on a half,
+  and counts larger than signed 64-bit integers.
 - Complete-unit retention, group closure and its documented partial-unit cases,
   missing values, eligibility, balance, mobility, connectivity and reconnect.
 - Row-order invariance and actual OpenMP teams of 1, 8 and 48 threads when
   the host exposes enough processors.
 - `sample2` compatibility, synthetic estimation and mobility checks, and an
   optional `reghdfe`/`xhdfe` comparison on the same synthetic sample.
-- Absorb-parser errors, failed-call RNG restoration, missing plugins and
-  rebinding after `discard`.
+- Frequency weights: a table of distinct rows with `[fweight=]` against the
+  rows it stands for, in the retention indicator and the stored results.
+- Absorb-parser errors, failed-call RNG restoration, missing plugins,
+  rebinding after `discard`, and a plugin replaced at the same path within a
+  session (the ado refuses a plugin of another release with r(498)).
 
 These tests passed on StataNow/MP 19.5 on Linux during the September 2026 audit.
 The C++ sampling implementation was unchanged by the fixes to the ado parser,
@@ -133,3 +137,134 @@ patents, 6,131 instead of 7,116 on synthetic-assortative, the same 35 on
 enron) and runs in well under a second, where 1.2.3 took up to 20 seconds
 (19.6 s to 0.2 s on patents with reconrule(key)). Every other
 stored result and every sample drawn without reconnect is identical to 1.2.3.
+
+## 1.4.0: frequency weights, and percentages rounded as Stata rounds them
+
+### Percentages rounded as Stata rounds them
+
+The number drawn in a stratum, `int(n*#/100+.5)`, was computed by the plugin as
+(n·#)/100. Stata evaluates `n*#/100` as n·(#/100), and in binary64 the two
+differ when (n·#)/100 is exactly a half and n·(#/100) falls just below it.
+There `sample` and `sample2` draw one fewer than 1.3.0 did: 29 percent of 50
+observations or units is 14, and 1.3.0 drew 15. Parity with `sample` failed in
+such strata, and so did the stated count for units and for the `movers()` and
+`stayers()` rates; `count` was not affected. In an affected stratum the 1.3.0
+draw is the 1.4.0 draw plus the next observation or unit in key order; group
+closure, `connected`, `reconnect` and `minmovers()` can carry that difference
+further. The random-number state after the call is unchanged, because the ado
+already used Stata's arithmetic to size the uniform keys.
+
+Evidence, on Linux with StataNow/MP 19.5:
+
+- `%21x` shows that Stata and Mata give `500*0.7/100` the value of
+  `500*(0.7/100)`, 3.4999999999999996, and `(500*0.7)/100` the value 3.5.
+- For n from 1 to 3,000 and # from 0.1 to 99.9 in steps of 0.1, the 1.3.0
+  formula differs from Stata's `int(n*#/100+.5)` in 829 of 2,997,000 pairs
+  (183 with a whole-number percentage); the 1.4.0 formula agrees in all of them.
+- The product is rounded before the half is added, whatever the compiler does
+  with multiply-add instructions. For n up to 100,000 and the same percentages,
+  a fused multiply-add would have given the same counts in all 99,900,000 pairs.
+- New certification cases compare twelve such pairs with `sample` (rows and
+  random-number state), a `by()` design with three such strata, units,
+  `movers()`/`stayers()` rates and 29 percent of 50 clusters with `sample2`.
+  The native plugin test run by the release workflow on the four platforms
+  now checks 29 percent of 50 observations. All of these fail with the 1.3.0
+  plugin and pass with 1.4.0.
+
+### Frequency weights
+
+With a sampling unit, `[fweight=w]` makes every observation stand for `w`
+identical ones. Every count of rows in the plugin becomes a sum of weights:
+the observations per unit behind `minobs()`/`maxobs()`, the rows of the graph
+components behind `connected`, `reconnect` and the connectivity shares, and the
+observation counts in `r()`. Counts of distinct units, periods, mobility values
+and groups, the draw and the tests on distinct rows (units split by `if`/`in`,
+group closure) are unchanged. A table of the distinct combinations of the
+variables a design uses, with their counts, therefore draws the sample of data
+that do not fit in memory, for example from an out-of-core engine. Weights
+must be positive integers summing to less than 2^53; observation-level sampling
+refuses them. Without weights the results are those of the rounding-corrected
+plugin.
+
+Evidence, on Linux with StataNow/MP 19.5:
+
+- New certification section 13: on a worker-firm-year panel repeated over
+  months (with missing firms) and on repeated patent-inventor pairs, the
+  table from `contract` with `[fw=w]` gives the rows' retention indicator and
+  every stored result except `r(n_uniforms)` in 17 designs: `minobs()`,
+  `maxobs()` with strata and periods, `connected`, `reconnect` under both
+  rules and an explicit target, `minmovers()`, rates with `mobstrata` and
+  `connectivity`, `balanced`, `count` with strata, `if` with `any` and `all`,
+  group closure under both rules and with `connected`, and, on data where 2
+  percent of the rows have no unit, `absorb()` as the unit source, a string
+  unit and `minperiods()`. The `by` prefix equals `by()` with weights and on
+  the rows. The weighted draw is identical with 1, 8 and 48 threads (with
+  `minobs()`, `connected` and `reconnect`) and after shuffling the rows;
+  weights multiplied by 10^9 change no decision and multiply every count
+  exactly; a total of 2^53 - 1 is accepted and 2^53 refused; errors are tested
+  for weights without a unit, `aweight`s, and non-integer, zero and missing
+  weights.
+- The same comparison without the weights fails for `minobs()`, `reconnect`,
+  `connected` and `minmovers()`, so the section detects unweighted counts.
+- The native plugin test checks a weighted `minobs()` design on the four
+  release platforms.
+- `r(n_uniforms)` and the random-number state after the call follow the rows
+  in memory, as the uniform keys are drawn over them; the draw is the same,
+  because a unit-level draw reads only the first U uniforms of the first key
+  column.
+- Interleaved A/B timings against 1.3.0 on a 20-million-row worker panel
+  (2 million workers, 200,000 firms, 8 threads, a shared host under load),
+  medians of four pairs: unit sample 2.19 s and 2.21 s, `connectivity` 2.49 s
+  and 2.46 s, `minmovers(2)` 2.68 s and 2.67 s, within the run-to-run spread.
+  The three indicators drawn there are identical in both versions (these
+  percentages are not rounding edges).
+- The full certification passes; the optional benchmark-connectivity block,
+  which needs the external datasets named by `XSF_SERGIO_DIR`, was skipped.
+
+### Independent audit of the candidate, and its corrections
+
+An independent read-only audit of the 1.4.0 candidate (25 September 2026)
+found no defect in the rounding correction or in the frequency weights. It
+reproduced them against Stata, `sample`, `sample2` and the `expand` oracle,
+built five mutant plugins (each caught by section 13) and repeated the timings.
+It reported one defect that blocked publication, two older defects of the
+same family, and five minor points. All were reproduced before and after the
+corrections below.
+
+- **A plugin left loaded by an update (high).** After `net install ..., replace`
+  and `discard`, as the README said, a session that had run 1.3.0 kept its
+  plugin: `discard`, `clear all` and a new `program ..., plugin` do not
+  unload a shared object. The 1.4.0 ado then ran on the 1.3.0 plugin, drawing
+  15 units for 29 percent of 50 without a word, and a weighted call stopped
+  with "varlist has wrong length". The plugin now reports its release to the
+  ado (local `xsf_plugin_version`, 10400) before anything else, and the ado
+  refuses any other release with r(498) and a request to restart Stata,
+  restoring the random-number state and leaving the data untouched. With the
+  1.3.0 plugin loaded, the README recipe now stops with r(498) at every call,
+  weighted or not; a new Stata session then draws 14. The binding
+  certification replaces the plugin at the same path within a session and
+  checks that the same release still passes; the refusal of an older release
+  was checked by hand, since no older binary ships with the tests. README,
+  INSTALL and the help now say to restart Stata after an update or a rebuild,
+  and never to copy a plugin over the file Stata has loaded, which crashed
+  Stata in the audit.
+- **`movers()`, `stayers()` and `recontarget()` rounded to about 13 digits
+  (medium, older than 1.4.0).** They went through `numlist`: `movers(12.49999999999999)`
+  became 12.5 and drew 1 of 4 movers where `int(n*#/100+.5)` gives 0. They now
+  reach the plugin as typed, as `#` does, with the same error codes as before
+  (r(121) for a non-number, r(125) out of range); section 12 checks the case.
+- **`reconnect` stopped one unit late at an exact target (low, older than 1.4.0).**
+  The share was compared in binary64, and 0.56 * 100 exceeds 56, so a sample
+  whose largest component held exactly 56 of 100 rows still added a unit under
+  `recontarget(56)` (likewise 55; the whole percentages affected with 100 rows
+  are 7, 14, 28, 55 and 56). Whole-percentage targets and the frame share are
+  now compared by cross-multiplication in 128-bit integers; the mobility
+  certification checks 56 of 100 (no unit added) and `recontarget(57)`
+  (three units, to 59 of 103).
+- **Minor points.** With weights, the deletion message now says how many
+  observations in memory were deleted and how many they stood for. The build
+  script adds `-ffp-contract=off` on every target, a second guard beside the
+  `volatile` product; the build-script test pins the flag. The README shows
+  `[fweight]` with the `by` prefix. Section 13 adds the 48-thread, 10^9 and
+  2^53 cases above. A string weight keeps Stata's own r(109) "type mismatch",
+  which `syntax` raises before `xsamplefe` runs, as for any Stata command.

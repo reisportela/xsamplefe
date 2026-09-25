@@ -19,6 +19,10 @@
 //   * Stata's plugin interface is called only from the thread that runs the
 //     plugin: reading cells from worker threads corrupts Stata's heap.
 //   * Counts and sizes are kept in 64-bit integers.
+//   * Frequency weights (unit mode only): a row with weight w stands for w
+//     identical rows, and every count of rows is a sum of weights, so the
+//     result is the one on the data after -expand w-. Counts of distinct
+//     units, periods, mobility values and groups are unchanged.
 //
 // varlist layout handed over by the ado (all numeric):
 //   [1]              touse  (1 = inside if/in and non-missing keys)
@@ -27,6 +31,7 @@
 //   [..]             time   (if has_time)
 //   [..]             mob    (if has_mob)
 //   [..]             group  (if has_group; block of inseparable rows)
+//   [..]             weight (if has_weight; positive integer frequency weight)
 //   [..]             u_1 .. u_nu uniform key columns (nu >= 0)
 //   [last]           out    (byte target: 1 = retained, 0 = dropped)
 #include "stplugin.h"
@@ -66,6 +71,12 @@
 namespace {
 
 constexpr const char* kPrefix = "xsamplefe plugin: ";
+
+// Release of this plugin (major*10000 + minor*100 + patch), handed to the ado
+// before anything else: a plugin loaded earlier in the Stata session stays in
+// use after net install, a rebuild or discard, and the ado refuses to run on
+// one of another release.
+constexpr const char* kPluginVersion = "10400";
 
 [[noreturn]] void fail(const std::string& msg) {
     throw std::runtime_error(std::string(kPrefix) + msg);
@@ -266,6 +277,7 @@ struct Config {
     bool has_time = false;
     bool has_mob = false;
     bool has_group = false;
+    bool has_weight = false;
     int nu = 0;
     FrameRule frame_rule = FrameRule::Strict;
     GroupRule group_rule = GroupRule::Any;
@@ -334,6 +346,7 @@ Config parse_config(const ParsedArgs& a) {
     c.has_group = parse_bool(a.required("has_group"), "has_group");
     c.nu = parse_int(a.required("nu"), "nu");
     if (c.nby < 0 || c.nu < 0) fail("invalid dimension arguments");
+    if (auto v = a.optional("has_weight")) c.has_weight = parse_bool(*v, "has_weight");
     if (auto v = a.optional("frame_rule")) c.frame_rule = parse_frame_rule(*v);
     if (auto v = a.optional("group_rule")) c.group_rule = parse_group_rule(*v);
     if (auto v = a.optional("balanced")) c.balanced = parse_bool(*v, "balanced");
@@ -376,6 +389,7 @@ Config parse_config(const ParsedArgs& a) {
              "minmovers() require a mobility dimension");
     }
     if (c.has_group && !c.has_unit) fail("group closure requires a sampling unit");
+    if (c.has_weight && !c.has_unit) fail("frequency weights require a sampling unit");
     if (c.reconnect && c.has_group) fail("reconnect may not be combined with a group() closure");
     if (c.minmovers >= 0 && c.has_group) fail("minmovers() may not be combined with a group() closure");
     if (c.minmovers >= 0 && c.reconnect) fail("minmovers() may not be combined with reconnect");
@@ -889,7 +903,12 @@ int64_t target_size(int64_t n, bool is_count, double pct, double count) {
         if (count >= static_cast<double>(n)) return n;
         return static_cast<int64_t>(count);
     }
-    const double k = std::floor(static_cast<double>(n) * pct / 100.0 + 0.5);
+    // Stata evaluates N*pct/100 as N*(pct/100): (N*pct)/100 differs when the
+    // product lands on a half (29 percent of 50 is 14 in Stata, not 15). The
+    // product is rounded before the half is added; volatile keeps a compiler
+    // from fusing the two into one multiply-add, which rounds only once.
+    volatile double scaled = static_cast<double>(n) * (pct / 100.0);
+    const double k = std::floor(scaled + 0.5);
     return std::max<int64_t>(0, std::min<int64_t>(n, static_cast<int64_t>(k)));
 }
 
@@ -933,6 +952,10 @@ constexpr int64_t kBigStratum = int64_t(1) << 18;
 
 STDLL stata_call(int argc, char* argv[]) {
     try {
+        // the local xsf_plugin_version of the calling ado
+        if (SF_macro_save(const_cast<char*>("_xsf_plugin_version"), const_cast<char*>(kPluginVersion))) {
+            fail("failed to report the plugin version");
+        }
         ParsedArgs args(argc, argv);
         const Config cfg = parse_config(args);
         ScopedThreadRequest thread_request(cfg.num_threads);
@@ -941,7 +964,8 @@ STDLL stata_call(int argc, char* argv[]) {
 
         // ---- varlist layout ------------------------------------------------
         const int expected_vars = 1 + (cfg.has_unit ? 1 : 0) + cfg.nby + (cfg.has_time ? 1 : 0) +
-                                  (cfg.has_mob ? 1 : 0) + (cfg.has_group ? 1 : 0) + cfg.nu + 1;
+                                  (cfg.has_mob ? 1 : 0) + (cfg.has_group ? 1 : 0) +
+                                  (cfg.has_weight ? 1 : 0) + cfg.nu + 1;
         if (SF_nvars() != expected_vars) {
             fail("varlist has wrong length (have " + std::to_string(SF_nvars()) + ", want " +
                  std::to_string(expected_vars) + ")");
@@ -954,6 +978,7 @@ STDLL stata_call(int argc, char* argv[]) {
         const int idx_time = cfg.has_time ? cursor++ : -1;
         const int idx_mob = cfg.has_mob ? cursor++ : -1;
         const int idx_group = cfg.has_group ? cursor++ : -1;
+        const int idx_w = cfg.has_weight ? cursor++ : -1;
         const int idx_u = cursor;
         cursor += cfg.nu;
         const int idx_out = cursor;
@@ -980,6 +1005,24 @@ STDLL stata_call(int argc, char* argv[]) {
         if (cfg.has_time) read_column(idx_time, om, n, time_raw);
         if (cfg.has_mob) read_column(idx_mob, om, n, mob_raw);
         if (cfg.has_group) read_column(idx_group, om, n, group_raw);
+        // Frequency weights: row i stands for wt[i] rows (empty: once each).
+        // Bounded by 2^53 in total, so every sum below is exact in a double.
+        std::vector<int64_t> wt;
+        int64_t W_all = n;
+        if (cfg.has_weight) {
+            wt.resize(static_cast<std::size_t>(n));
+            W_all = 0;
+            for (int64_t i = 0; i < n; ++i) {
+                const double z = read_cell(idx_w, om.obs_no(i));
+                if (!(z >= 1.0 && z < kExactIntLimit) || std::trunc(z) != z) {
+                    fail("frequency weights must be positive integers");
+                }
+                wt[static_cast<std::size_t>(i)] = static_cast<int64_t>(z);
+                W_all += wt[static_cast<std::size_t>(i)];
+                if (W_all >= static_cast<int64_t>(kExactIntLimit)) fail("frequency weights sum to 2^53 or more");
+            }
+        }
+        auto row_w = [&wt](int64_t i) -> int64_t { return wt.empty() ? 1 : wt[static_cast<std::size_t>(i)]; };
         if (cfg.frame_from_keys) {
             // the ado's markout: a row is in the frame when its unit (and
             // group) value is not missing
@@ -1056,6 +1099,18 @@ STDLL stata_call(int argc, char* argv[]) {
             observe_team(ts);
 #pragma omp for schedule(static) reduction(+ : n_frame)
             for (int64_t i = 0; i < n; ++i) n_frame += frame[static_cast<std::size_t>(i)];
+        }
+        int64_t W_frame = n_frame;
+        if (!wt.empty()) {
+            W_frame = 0;
+#pragma omp parallel
+            {
+                observe_team(ts);
+#pragma omp for schedule(static) reduction(+ : W_frame)
+                for (int64_t i = 0; i < n; ++i) {
+                    if (frame[static_cast<std::size_t>(i)]) W_frame += wt[static_cast<std::size_t>(i)];
+                }
+            }
         }
 
         // Rows pulled into the frame by `any` must carry every required key.
@@ -1209,7 +1264,12 @@ STDLL stata_call(int argc, char* argv[]) {
             for (int64_t u = 0; u < U; ++u) {
                 const int64_t lo = ucsr.off[static_cast<std::size_t>(u)];
                 const int64_t hi = ucsr.off[static_cast<std::size_t>(u) + 1];
-                u_nobs[static_cast<std::size_t>(u)] = hi - lo;
+                int64_t rows = hi - lo;
+                if (!wt.empty()) {
+                    rows = 0;
+                    for (int64_t k = lo; k < hi; ++k) rows += wt[static_cast<std::size_t>(ucsr.rows[static_cast<std::size_t>(k)])];
+                }
+                u_nobs[static_cast<std::size_t>(u)] = rows;
                 if (hi <= lo) continue;
                 const int32_t s0 = strata_id[static_cast<std::size_t>(ucsr.rows[static_cast<std::size_t>(lo)])];
                 u_str[static_cast<std::size_t>(u)] = s0;
@@ -1375,7 +1435,7 @@ STDLL stata_call(int argc, char* argv[]) {
                     for (int64_t k = lo; k < hi; ++k) {
                         const int32_t row = ucsr.rows[static_cast<std::size_t>(k)];
                         if (!rowmask[static_cast<std::size_t>(row)]) continue;
-                        ++rows;
+                        rows += row_w(row);
                         const int32_t m = mob_id[static_cast<std::size_t>(row)];
                         if (m >= 0) lk_scratch[static_cast<std::size_t>(lo + d++)] = m;
                     }
@@ -1813,12 +1873,26 @@ STDLL stata_call(int argc, char* argv[]) {
             int64_t total = cs0.rows;
             int32_t lcc = cs0.lcc_root;
             int64_t best = cs0.lcc_rows;
-            const double target =
-                (cfg.recon_target >= 0.0)
-                    ? cfg.recon_target / 100.0
-                    : (frame_cs.rows > 0 ? static_cast<double>(frame_cs.lcc_rows) /
-                                               static_cast<double>(frame_cs.rows)
-                                         : 0.0);
+            // The largest component is short of the target while best/total is
+            // below recontarget()/100 or the frame's share. A whole percentage
+            // and the frame share are compared by cross-multiplication in
+            // integers (weighted rows can reach 2^53, so the products need 128
+            // bits); a quotient in binary64 rounds: 0.56 * 100 > 56 made a
+            // sample at exactly 56 percent look short of recontarget(56).
+            const bool explicit_target = cfg.recon_target >= 0.0;
+            const bool whole_target = explicit_target && std::floor(cfg.recon_target) == cfg.recon_target;
+            const bool has_target = explicit_target ? cfg.recon_target > 0.0
+                                                    : (frame_cs.rows > 0 && frame_cs.lcc_rows > 0);
+            auto below_target = [&](int64_t b, int64_t t) {
+                if (!explicit_target) {
+                    return static_cast<__int128>(b) * frame_cs.rows < static_cast<__int128>(frame_cs.lcc_rows) * t;
+                }
+                if (whole_target) {
+                    return static_cast<__int128>(b) * 100 <
+                           static_cast<__int128>(static_cast<int64_t>(cfg.recon_target)) * t;
+                }
+                return static_cast<double>(b) * 100.0 < cfg.recon_target * static_cast<double>(t);
+            };
             std::vector<uint8_t> cand(static_cast<std::size_t>(U), 0);
             int64_t ncand = 0;
             for (int64_t u = 0; u < U; ++u) {
@@ -1828,7 +1902,7 @@ STDLL stata_call(int argc, char* argv[]) {
                     ++ncand;
                 }
             }
-            if (lcc >= 0 && ncand > 0 && target > 0.0) {
+            if (lcc >= 0 && ncand > 0 && has_target) {
                 // distinct (mobility value, candidate unit) links, both ways
                 std::vector<std::pair<int32_t, int32_t>> mu;
                 for (int64_t i = 0; i < n; ++i) {
@@ -1928,7 +2002,7 @@ STDLL stata_call(int argc, char* argv[]) {
                     push_value(cvals[static_cast<std::size_t>(k)]);
                 }
                 std::vector<int32_t> merged;
-                while (total > 0 && static_cast<double>(best) < target * static_cast<double>(total)) {
+                while (total > 0 && below_target(best, total)) {
                     int32_t pick = -1;
                     while (!heap.empty()) {
                         std::pop_heap(heap.begin(), heap.end(), worse);
@@ -2006,7 +2080,7 @@ STDLL stata_call(int argc, char* argv[]) {
                             const std::size_t row = static_cast<std::size_t>(ucsr.rows[static_cast<std::size_t>(k)]);
                             if (!rowmask[row]) continue;
                             keep[row] = 0;
-                            ++dropped;
+                            dropped += row_w(static_cast<int64_t>(row));
                         }
                     }
                 }
@@ -2106,7 +2180,14 @@ STDLL stata_call(int argc, char* argv[]) {
             for (int64_t u = 0; u < U; ++u) {
                 const std::size_t uu = static_cast<std::size_t>(u);
                 int64_t cnt = 0;
-                for (int64_t k = ucsr.off[uu]; k < ucsr.off[uu + 1]; ++k) cnt += keep[static_cast<std::size_t>(ucsr.rows[static_cast<std::size_t>(k)])];
+                if (wt.empty()) {
+                    for (int64_t k = ucsr.off[uu]; k < ucsr.off[uu + 1]; ++k) cnt += keep[static_cast<std::size_t>(ucsr.rows[static_cast<std::size_t>(k)])];
+                } else {
+                    for (int64_t k = ucsr.off[uu]; k < ucsr.off[uu + 1]; ++k) {
+                        const std::size_t row = static_cast<std::size_t>(ucsr.rows[static_cast<std::size_t>(k)]);
+                        if (keep[row]) cnt += wt[row];
+                    }
+                }
                 u_retrows[uu] = cnt;
                 N_frame_retained += cnt;
             }
@@ -2165,12 +2246,12 @@ STDLL stata_call(int argc, char* argv[]) {
         timer.mark("write");
 
         const std::string p = cfg.s_prefix;
-        save_scalar(p + "N_total", static_cast<double>(n));
-        save_scalar(p + "N_frame", static_cast<double>(n_frame));
-        save_scalar(p + "N_outside", static_cast<double>(n - n_frame));
+        save_scalar(p + "N_total", static_cast<double>(W_all));
+        save_scalar(p + "N_frame", static_cast<double>(W_frame));
+        save_scalar(p + "N_outside", static_cast<double>(W_all - W_frame));
         save_scalar(p + "N_ineligible", static_cast<double>(N_inelig));
         save_scalar(p + "N_frame_retained", static_cast<double>(N_frame_retained));
-        save_scalar(p + "N_retained", static_cast<double>(N_frame_retained + (n - n_frame)));
+        save_scalar(p + "N_retained", static_cast<double>(N_frame_retained + (W_all - W_frame)));
         save_scalar(p + "N_connected_dropped", static_cast<double>(N_connected_dropped));
         save_scalar(p + "n_components", static_cast<double>(n_components));
         save_scalar(p + "U_frame", static_cast<double>(U));

@@ -38,16 +38,19 @@ int write_value(int v, int r, double value) {
     return 0;
 }
 int scalar_save(char* name, double value) { scalars[name] = value; return 0; }
+std::map<std::string, std::string> macros;
+int macro_save(char* name, char* value) { macros[name] = value; return 0; }
 void require(bool ok, const std::string& why) { if (!ok) throw std::runtime_error(why); }
 double scalar(const char* name) { return scalars.at(std::string("probe_") + name); }
 using Call = ST_retcode (*)(int, char*[]);
 
 void run(Call call, Columns input, const std::string& config, int threads) {
-    data = std::move(input); scalars.clear(); error.clear();
+    data = std::move(input); scalars.clear(); macros.clear(); error.clear();
     std::string args = "cfg=" + config + ";num_threads=" + std::to_string(threads) + ";s_prefix=probe_;";
     char* argv[] = {args.data()};
     int rc = call(1, argv);
     require(rc == 0, "plugin error " + std::to_string(rc) + ": " + error);
+    require(!macros["_xsf_plugin_version"].empty(), "plugin did not report its release to the ado");
     require(scalar("openmp_enabled") == 1, "production plugin has no OpenMP");
     require(scalar("threads_used") == std::min<double>(threads, scalar("thread_capacity")), "requested team was not observed");
 }
@@ -73,6 +76,7 @@ int main(int argc, char** argv) {
         api.safevdata = read_value; api.vdata = read_value;
         api.safestore = write_value; api.store = write_value;
         api.scalsave = scalar_save;
+        api.macresave = macro_save;
         api.nobs = rows; api.nvar = vars; api.nvars = vars;
         api.nobs1 = first; api.nobs2 = rows; api.selobs = selected;
         api.missval = 8.0e307; api.stopflag = &stop;
@@ -100,6 +104,21 @@ int main(int argc, char** argv) {
             require(scalar("U_partial") == 2 && scalar("G_kept") == 2, "group diagnostics mismatch");
             run(call, Columns(4), obs, threads);
             require(scalar("N_total") == 0 && scalar("N_retained") == 0, "empty-frame mismatch");
+            // 29 percent of 50 is 14 as Stata evaluates int(50*29/100+.5)
+            std::vector<double> keys50(50), expect50(50);
+            for (int i = 0; i < 50; ++i) {
+                keys50[static_cast<std::size_t>(i)] = ((i * 37) % 50) / 50.0;
+                expect50[static_cast<std::size_t>(i)] = ((i * 37) % 50) < 14 ? 1 : 0;
+            }
+            run(call, {std::vector<double>(50,1),keys50,std::vector<double>(50,.5),std::vector<double>(50,7)},
+                "is_count=0;pct=29;has_unit=0;nby=0;has_time=0;has_mob=0;has_group=0;nu=2", threads);
+            require(scalar("N_retained") == 14 && data.back() == expect50, "percentage rounding differs from Stata");
+            // frequency weights count as rows: with minobs(3) unit 20 (weight 1) is ineligible
+            run(call, {std::vector<double>(4,1),{10,10,20,30},{1,2,1,5},std::vector<double>(4,7)},
+                "is_count=0;pct=100;has_unit=1;nby=0;has_time=0;has_mob=0;has_group=0;has_weight=1;nu=0;minobs=3", threads);
+            require(data.back() == std::vector<double>({1,1,0,1}) && scalar("N_total") == 9 &&
+                        scalar("N_retained") == 8 && scalar("N_ineligible") == 1 && scalar("U_eligible") == 2,
+                    "frequency weights are not counted as rows");
         }
         std::cout << "XSAMPLEFE NATIVE PLUGIN SPI TEST PASSED\n";
         return 0;

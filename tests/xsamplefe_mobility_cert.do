@@ -340,6 +340,18 @@ set seed 1
 xsamplefe 10, absorb(worker firm year) recontarget(1) generate(t1)
 assert r(N_units_reconnected) == 0 & r(N_reconnected) == 0
 assert t1 == g0
+* a sample exactly at the target is not short of it: 56 of 100 rows meet
+* recontarget(56), although 0.56 * 100 exceeds 56 in binary64
+clear
+quietly set obs 200
+gen long u = _n
+gen byte f = 1 + (u > 120)
+xsamplefe 100, count unit(u) mobility(f) connectivity seed(51) generate(at)
+assert r(N) == 100 & r(lcc_share) == 56/100
+xsamplefe 100, count unit(u) mobility(f) recontarget(56) seed(51) generate(at56)
+assert r(N_units_reconnected) == 0 & at56 == at
+xsamplefe 100, count unit(u) mobility(f) recontarget(57) seed(51) generate(at57)
+assert r(N_units_reconnected) == 3 & r(lcc_share) == 59/103
 noi di as text "  reconnect: deterministic (1/8 threads, shuffled rows) and target-aware"
 
 * ---------------------------------------------------------------------------

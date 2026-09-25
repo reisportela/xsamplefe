@@ -36,7 +36,10 @@ help xsamplefe
 ```
 
 This address always selects the **latest stable release**. Run the same command
-again to update. Stata selects the binary for Linux x86-64, Windows x86-64,
+again to update; if `xsamplefe` has already run in the Stata session, then
+restart Stata: `discard` reloads the ado-file but not the plugin, and
+`xsamplefe` refuses to run on a plugin of another release (r(498)).
+Stata selects the binary for Linux x86-64, Windows x86-64,
 macOS Apple Silicon, or macOS Intel. No compiler is needed; Mac releases include
 OpenMP, and Windows compiler runtimes are linked statically. See
 [INSTALL.md](INSTALL.md) for system requirements and local installation.
@@ -126,8 +129,8 @@ check `r(N_units_partial)` and `r(N_units_ineligible_retained)`.
 ## Features
 
 ```
-xsamplefe # [if] [in] [, options]        # is a percentage, or a count with -count-
-by varlist: xsamplefe # [, options]      same as by(varlist)
+xsamplefe # [if] [in] [fweight] [, options]  # is a percentage, or a count with -count-
+by varlist: xsamplefe # [fweight] [, options] same as by(varlist)
 ```
 
 | Group | Options |
@@ -167,6 +170,14 @@ diagnostics, `r(rngstate)` before drawing and the dimensions used. See `help xsa
   `group()` the rows of a group are never separated (`grouprule(any|all)`).
 - Unlike `sample`, `in` may be combined with `by()`: `xsamplefe` never sorts
   the data, so the range is well defined and rows outside it are kept.
+- With a unit, `[fweight=w]` makes every observation stand for `w` identical
+  ones: the units drawn and retained, and every count of observations in
+  `r()`, are those of the data after `expand w`. A table of the distinct
+  combinations of the variables the command uses, with their counts (from
+  `contract` or from an out-of-core engine such as `parqit`), thus draws the
+  sample of data too large for memory; the retained units are then kept in
+  the full data. Weights must be positive integers; observation-level sampling
+  does not accept them.
 
 ## Mobility fidelity
 
@@ -357,6 +368,11 @@ For session-only use, build with `--output stata/xsamplefe.plugin`, then:
 adopath ++ "/path/to/xsamplefe/stata"
 discard
 ```
+
+A plugin stays loaded until Stata exits: after a rebuild, restart Stata if
+`xsamplefe` has already run in the session. Never copy a plugin over the file
+a running Stata has loaded (that can crash Stata); the build script and
+`net install` write a new file instead.
 
 Compiled binaries are release assets and are not stored in Git. Each build
 target gets a separate filename in `stata/`; `net install` selects the matching

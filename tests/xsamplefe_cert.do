@@ -522,4 +522,281 @@ xsamplefe 100, unit(u) time(t) balanced generate(s)
 assert r(N_periods) == 0 & r(N_units_eligible) == 0 & s == 0
 noi di as text "  time(): xtset and explicit agree; balanced with no period keeps nobody"
 
+* ---------------------------------------------------------------------------
+* 12. int(n*#/100+.5) is rounded as Stata evaluates it, n*(#/100)
+* ---------------------------------------------------------------------------
+* In these pairs (n*#)/100 lands on a half and n*(#/100) just below it, so
+* sample draws one fewer than a left-to-right product would (1.3.0 did).
+local edges 25 58 45 70 50 29 50 57 75 82 85 70 90 35 100 14.5 100 28.5 100 56.5 100 57.5 500 0.7
+while ("`edges'" != "") {
+    gettoken n edges : edges
+    gettoken p edges : edges
+    assert int(`n'*`p'/100+.5) == floor((`n'*`p')/100+.5) - 1
+    clear
+    quietly set obs `n'
+    gen long __id = _n
+    set seed 11
+    quietly sample `p'
+    assert _N == int(`n'*`p'/100+.5)
+    xcert_ids
+    local ref `r(ids)'
+    local ref_state = c(rngstate)
+    clear
+    quietly set obs `n'
+    gen long __id = _n
+    set seed 11
+    quietly xsamplefe `p'
+    xcert_ids
+    assert "`ref'" == "`r(ids)'"
+    assert c(rngstate) == "`ref_state'"
+}
+
+* by(): each stratum rounds on its own (45, 85 and 165 are edges at 70 percent)
+clear
+quietly set obs 305
+gen long __id = _n
+gen byte g = 1 + (_n > 45) + (_n > 130) + (_n > 295)
+preserve
+set seed 12
+quietly sample 70, by(g)
+assert _N == 31 + 59 + 115 + 7
+xcert_ids
+local ref `r(ids)'
+local ref_state = c(rngstate)
+restore
+set seed 12
+quietly xsamplefe 70, by(g)
+assert r(N_target) == 31 + 59 + 115 + 7
+xcert_ids
+assert "`ref'" == "`r(ids)'"
+assert c(rngstate) == "`ref_state'"
+
+* units, and movers()/stayers() rates, use the same rounding
+clear
+quietly set obs 50
+gen long id = _n
+expand 3
+quietly xsamplefe 29, unit(id) seed(13) generate(s)
+assert r(N_units_sampled) == int(50*29/100+.5) & r(N_units_sampled) == 14
+clear
+quietly set obs 135
+gen long u = _n
+expand 2
+bysort u: gen int m = cond(u <= 45, 10*u + _n, 10*u)
+quietly xsamplefe 10, unit(u) mobility(m) movers(70) stayers(35) seed(14) generate(s)
+assert r(N_movers_eligible) == 45 & r(N_units_eligible) == 135
+assert r(N_movers_sampled) == int(45*70/100+.5)
+assert r(N_units_sampled) == int(45*70/100+.5) + int(90*35/100+.5)
+* # and the rates reach the plugin as typed: a numlist would round
+* 12.49999999999999 to 12.5, and 4 units at 12.5 percent round to 1, not 0
+clear
+quietly set obs 4
+gen long __id = _n
+quietly sample 12.49999999999999
+assert _N == 0
+clear
+quietly set obs 4
+gen long __id = _n
+quietly xsamplefe 12.49999999999999
+assert _N == 0
+clear
+quietly set obs 24
+gen long u = _n
+expand 2
+bysort u: gen int m = cond(u <= 4, 10*u + _n, 10*u)
+quietly xsamplefe 10, unit(u) mobility(m) movers(12.49999999999999) stayers(0) seed(15) generate(s)
+assert r(N_movers_eligible) == 4 & r(N_movers_sampled) == 0
+noi di as text "  rounding: int(n*#/100+.5) as Stata evaluates it (rows, by(), units, movers/stayers)"
+
+* ---------------------------------------------------------------------------
+* 13. Frequency weights: a table of distinct rows with their counts draws
+*     exactly what the rows draw
+* ---------------------------------------------------------------------------
+* The rows and contract's table must agree in every retained row and in every
+* stored result, except the number of uniform columns, which follows the rows
+* in memory (so does the random-number state after the call).
+capture program drop xcert_fw
+program define xcert_fw
+    syntax, rows(string) tuples(string) keys(string) num(string) [qual(string) opts(string)]
+    use `"`rows'"', clear
+    quietly xsamplefe `num' `qual', `opts' generate(k)
+    local rsc : r(scalars)
+    foreach s of local rsc {
+        local E_`s' : display %21x r(`s')
+    }
+    collapse (min) kmin = k (max) kmax = k, by(`keys')
+    assert kmin == kmax
+    tempfile ek
+    quietly save `ek'
+    use `"`tuples'"', clear
+    quietly xsamplefe `num' `qual' [fw=w], `opts' generate(k)
+    assert "`r(wtype)'" == "fweight"
+    foreach s of local rsc {
+        if ("`s'" == "n_uniforms") continue
+        local b : display %21x r(`s')
+        if ("`b'" != "`E_`s''") {
+            di as error "`num' `qual', `opts': r(`s') is `E_`s'' on the rows, `b' with weights"
+            exit 9
+        }
+    }
+    merge 1:1 `keys' using `ek', assert(match) nogenerate
+    assert k == kmin
+end
+
+* worker-firm-year cells repeated over months; some firms missing
+clear
+set seed 20260925
+quietly set obs 1500
+gen long worker = 3*_n + 1
+gen byte region = 1 + floor(4*runiform())
+gen int entry = 2000 + floor(5*runiform())
+gen byte len = 1 + floor(6*runiform())
+expand len
+bysort worker: gen int year = entry + _n - 1
+gen int firm = 1 + floor(150*runiform())
+bysort worker (year): replace firm = cond(runiform() < 0.2, 1 + floor(150*runiform()), firm[_n-1]) if _n > 1
+expand 1 + floor(12*runiform())
+replace firm = . if runiform() < 0.01
+drop entry len
+tempfile rows tuples
+quietly save `rows'
+contract worker firm year region, freq(w)
+quietly save `tuples'
+local fw rows(`rows') tuples(`tuples') keys(worker firm year region)
+
+xcert_fw, `fw' num(20) opts(unit(worker) mobility(firm) minobs(24) seed(1))
+xcert_fw, `fw' num(20) opts(unit(worker) mobility(firm) time(year) maxobs(30) minperiods(2) by(region) seed(2))
+xcert_fw, `fw' num(10) opts(unit(worker) mobility(firm) connected seed(3))
+xcert_fw, `fw' num(20) opts(unit(worker) mobility(firm) reconnect seed(4))
+xcert_fw, `fw' num(25) opts(unit(worker) mobility(firm) reconnect reconrule(key) recontarget(90) seed(5))
+xcert_fw, `fw' num(30) opts(unit(worker) mobility(firm) minmovers(2) seed(6))
+xcert_fw, `fw' num(15) opts(unit(worker) mobility(firm) time(year) movers(50) stayers(10) mobstrata connectivity seed(7))
+xcert_fw, `fw' num(15) opts(unit(worker) time(year) balanced seed(8))
+xcert_fw, `fw' num(40) opts(count unit(worker) by(region) seed(9))
+xcert_fw, `fw' num(20) qual(if year >= 2004) opts(unit(worker) all seed(10))
+xcert_fw, `fw' num(20) qual(if year >= 2004) opts(unit(worker) mobility(firm) any connectivity seed(11))
+
+* group closure: patents and inventors, each pair repeated
+clear
+quietly set obs 800
+gen long patent = 5*_n
+gen byte nteam = 1 + floor(4*runiform())
+expand nteam
+gen long inventor = 1 + floor(600*runiform())
+expand 1 + floor(5*runiform())
+drop nteam
+tempfile prow ptup
+quietly save `prow'
+contract patent inventor, freq(w)
+quietly save `ptup'
+local fw rows(`prow') tuples(`ptup') keys(patent inventor)
+xcert_fw, `fw' num(30) opts(group(patent) individual(inventor) unit(inventor) seed(12))
+xcert_fw, `fw' num(30) opts(group(patent) individual(inventor) unit(inventor) grouprule(all) seed(13))
+xcert_fw, `fw' num(20) opts(group(patent) individual(inventor) unit(inventor) connected seed(14))
+
+* rows without a unit (outside the frame, kept), a string unit, absorb()
+clear
+quietly set obs 1200
+gen long worker = 3*_n + 1
+gen byte region = 1 + floor(4*runiform())
+gen int entry = 2000 + floor(5*runiform())
+gen byte len = 1 + floor(6*runiform())
+expand len
+bysort worker: gen int year = entry + _n - 1
+gen int firm = 1 + floor(120*runiform())
+bysort worker (year): replace firm = cond(runiform() < 0.2, 1 + floor(120*runiform()), firm[_n-1]) if _n > 1
+expand 1 + floor(12*runiform())
+replace worker = . if runiform() < 0.02
+gen str8 sid = cond(missing(worker), "", "w" + string(worker, "%06.0f"))
+drop entry len
+tempfile mrow mtup
+quietly save `mrow'
+contract worker sid firm year region, freq(w)
+quietly save `mtup'
+local fw rows(`mrow') tuples(`mtup') keys(worker sid firm year region)
+xcert_fw, `fw' num(20) opts(absorb(worker firm year) minobs(20) connected seed(15))
+xcert_fw, `fw' num(25) opts(unit(sid) mobility(firm) reconnect seed(16))
+xcert_fw, `fw' num(30) opts(unit(worker) mobility(firm) time(year) minperiods(2) connectivity seed(17))
+* the by prefix equals by(), weighted or on the rows
+use `mtup', clear
+sort region
+set seed 18
+by region: xsamplefe 20 [fw=w], unit(worker) minobs(10) generate(kp)
+local np = r(N)
+set seed 18
+xsamplefe 20 [fw=w], unit(worker) minobs(10) by(region) generate(kb)
+assert kp == kb & r(N) == `np'
+use `mrow', clear
+sort region
+set seed 18
+by region: xsamplefe 20, unit(worker) minobs(10) generate(kr)
+assert r(N) == `np'
+
+* the weighted draw is invariant to threads and row order; r(N) sums weights
+use `tuples', clear
+foreach threads in 1 8 48 {
+    set seed 1
+    xsamplefe 20 [fw=w], unit(worker) mobility(firm) minobs(24) generate(t`threads') numthreads(`threads')
+    assert r(threads_used) == min(`threads', r(thread_capacity))
+}
+assert t1 == t8 & t1 == t48
+foreach d in connected reconnect {
+    foreach threads in 1 48 {
+        quietly xsamplefe 20 [fw=w], unit(worker) mobility(firm) `d' seed(2) generate(`d'`threads') numthreads(`threads')
+    }
+    assert `d'1 == `d'48
+}
+gen double __shuffle = runiform()
+sort __shuffle
+set seed 1
+xsamplefe 20 [fw=w], unit(worker) mobility(firm) minobs(24) generate(tsh)
+assert t1 == tsh
+quietly summarize w if t1, meanonly
+local wsum = r(sum)
+set seed 1
+xsamplefe 20 [fw=w], unit(worker) mobility(firm) minobs(24)
+assert r(N) == `wsum'
+quietly summarize w, meanonly
+assert r(sum) == `wsum'
+
+* weights beyond 2^31: multiplying them all by 10^9 changes no decision and
+* multiplies every count of observations exactly
+use `tuples', clear
+gen double wbig = 1e9 * w
+foreach d in connected reconnect {
+    quietly xsamplefe 20 [fw=w], unit(worker) mobility(firm) `d' seed(31) generate(small)
+    local n = r(N)
+    local total = r(N_total)
+    quietly xsamplefe 20 [fw=wbig], unit(worker) mobility(firm) `d' seed(31) generate(big)
+    assert small == big & r(N) == 1e9 * `n' & r(N_total) == 1e9 * `total'
+    drop small big
+}
+* the sum of the weights must stay below 2^53, where every count is exact
+clear
+quietly set obs 2
+gen long u = _n
+gen double w = cond(_n == 1, 2^52, 2^52 - 1)
+xsamplefe 100 [fw=w], unit(u)
+assert r(N_total) == 2^53 - 1
+replace w = 2^52 in 2
+capture xsamplefe 100 [fw=w], unit(u)
+assert _rc == 402
+
+* weights need a unit, and must be positive integers
+use `tuples', clear
+capture xsamplefe 20 [fw=w]
+assert _rc == 101
+capture xsamplefe 20 [aw=w], unit(worker)
+assert _rc == 101
+replace w = 1.5 in 1
+capture xsamplefe 20 [fw=w], unit(worker)
+assert _rc == 401
+replace w = 0 in 1
+capture xsamplefe 20 [fw=w], unit(worker)
+assert _rc == 402
+replace w = . in 1
+capture xsamplefe 20 [fw=w], unit(worker)
+assert _rc == 402
+noi di as text "  fweights: contract's table with [fw=] equals the rows (17 designs, by prefix), threads, order, 2^31 and 2^53, errors"
+
 noi di as text "xsamplefe certification passed"

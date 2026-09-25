@@ -1,4 +1,4 @@
-*! version 1.3.0  24sep2026
+*! version 1.4.0  25sep2026
 *! xsamplefe: panel / fixed-effect aware random sampling for reghdfe and xhdfe
 *! - sample / sample2 semantics for the simple cases (drawn rows are
 *!   bit-identical to sample under the same seed and data order)
@@ -11,7 +11,14 @@
 program define xsamplefe, rclass byable(onecall)
     version 14.0
 
-    local 0 `"=`0'"'
+    // syntax keeps both # and a weight expression in exp: the weight is taken
+    // off first, then # is parsed as before
+    syntax anything(name=pct_arg equalok) [if] [in] [fweight] [, *]
+    local wtype `weight'
+    local wexp `"`exp'"'
+    local weight
+    local 0 `"=`pct_arg' `if' `in'"'
+    if (`"`options'"' != "") local 0 `"`0', `options'"'
     syntax =/exp [if] [in] [, ///
         Count ///
         BY(varlist) ///
@@ -25,11 +32,11 @@ program define xsamplefe, rclass byable(onecall)
         MINObs(numlist max=1 integer >=0) MAXObs(numlist max=1 integer >=0) ///
         MINPeriods(numlist max=1 integer >=0) MAXPeriods(numlist max=1 integer >=0) ///
         MINMobility(numlist max=1 integer >=0) MAXMobility(numlist max=1 integer >=0) ///
-        MOVers(numlist max=1 >=0) STAYers(numlist max=1 >=0) ///
+        MOVers(string) STAYers(string) ///
         MOBSTRata ///
         ANY ALL GROUPRule(string) ///
         CONNECTIVity CONNected MINMOVers(numlist max=1 integer >=0) ///
-        RECONnect RECONTarget(numlist max=1 >=0 <=100) ///
+        RECONnect RECONTarget(string) ///
         RECONRule(string) ///
         GENerate(name) KEEP(name) REPLACE ///
         SEED(string) ///
@@ -127,6 +134,21 @@ program define xsamplefe, rclass byable(onecall)
         }
     }
     else local grouprule any
+    // movers(), stayers() and recontarget() reach the plugin as typed, as #
+    // does: a numlist would keep only about 13 significant digits
+    foreach r in movers stayers recontarget {
+        local `r' = strtrim(`"``r''"')
+        if ("``r''" == "") continue
+        capture confirm number ``r''
+        if (_rc) {
+            di as err "`r'(): ``r'' is not a number"
+            exit 121
+        }
+        if (``r'' < 0 | ("`r'" == "recontarget" & ``r'' > 100)) {
+            di as err "`r'(): ``r'' is outside the allowed range"
+            exit 125
+        }
+    }
     foreach r in movers stayers {
         if ("``r''" == "") continue
         if (!`is_count' & ``r'' > 100) {
@@ -280,6 +302,31 @@ program define xsamplefe, rclass byable(onecall)
     local block
     if ("`group'" != "" & "`group'" != "`unit'") local block `group'
     local has_block = ("`block'" != "")
+
+    // ---- frequency weights: an observation stands for w observations -------
+    local has_weight = ("`wtype'" != "")
+    if (`has_weight') {
+        if (!`has_unit') {
+            di as err "{p 0 4}fweights require a sampling unit (unit(), absorb() or group()): observation-level sampling draws every observation on its own{p_end}"
+            exit 101
+        }
+        tempvar wvar
+        quietly gen double `wvar' `wexp'
+        capture assert `wvar' == int(`wvar') if `wvar' < .
+        if (_rc) {
+            di as err "may not use noninteger frequency weights"
+            exit 401
+        }
+        quietly summarize `wvar', meanonly
+        if (r(N) < _N | r(min) < 1) {
+            di as err "frequency weights must be 1 or more in every observation (zero, negative or missing weights found)"
+            exit 402
+        }
+        if (r(sum) >= 2^53) {
+            di as err "frequency weights sum to 2^53 or more"
+            exit 402
+        }
+    }
 
     // ---- time (resolved before the mobility default) ------------------------
     local need_time = ("`balanced'" != "" | `minperiods' >= 0 | `maxperiods' >= 0)
@@ -450,7 +497,7 @@ program define xsamplefe, rclass byable(onecall)
     }
     else local cfg "`cfg'pct=`exp';"
     local cfg "`cfg'has_unit=`has_unit';nby=`nby';has_time=`has_time';has_mob=`has_mob';"
-    local cfg "`cfg'has_group=`has_block';nu=`nu';frame_rule=`frame_rule';group_rule=`grouprule';"
+    local cfg "`cfg'has_group=`has_block';has_weight=`has_weight';nu=`nu';frame_rule=`frame_rule';group_rule=`grouprule';"
     local cfg "`cfg'balanced=`=("`balanced'" != "")';minobs=`minobs';maxobs=`maxobs';"
     local cfg "`cfg'minperiods=`minperiods';maxperiods=`maxperiods';"
     local cfg "`cfg'minmob=`minmobility';maxmob=`maxmobility';"
@@ -504,8 +551,11 @@ program define xsamplefe, rclass byable(onecall)
     }
     global XSAMPLEFE_PLUGIN_PATH_INTERNAL "`plugin_path'"
 
+    // the plugin reports its release in local xsf_plugin_version (10400 = 1.4.0);
+    // releases before 1.4.0 report nothing
+    local xsf_plugin_version
     capture noisily plugin call `plugin_prog' `touse' `unit_use' `by_use' `time_use' ///
-        `mobility_use' `block_use' `ulist' `out', "`cfg'"
+        `mobility_use' `block_use' `wvar' `ulist' `out', "`cfg'"
     local rc = _rc
 
     local scalars N_total N_frame N_outside N_ineligible N_frame_retained N_retained ///
@@ -517,6 +567,16 @@ program define xsamplefe, rclass byable(onecall)
         WEAK_frame WEAK_sample U_reconnected N_reconnected ///
         U_minmovers_dropped N_minmovers_dropped minmovers_iterations ///
         threads_requested threads_effective threads_used openmp_enabled thread_capacity
+    // a plugin loaded earlier in the session stays in use after net install, a
+    // rebuild or discard, so one of another release must be refused here
+    if ("`xsf_plugin_version'" != "10400") {
+        foreach s of local scalars {
+            capture scalar drop `sp'`s'
+        }
+        quietly set rngstate `rngstate'
+        di as err "{p 0 4}xsamplefe: the xsamplefe.plugin loaded in this Stata session does not belong to this xsamplefe.ado (a plugin stays loaded after net install, a rebuild or discard): exit and restart Stata{p_end}"
+        exit 498
+    }
     if (`rc') {
         foreach s of local scalars {
             capture scalar drop `sp'`s'
@@ -544,7 +604,9 @@ program define xsamplefe, rclass byable(onecall)
         label variable `generate' "xsamplefe: 1 = retained in sample"
     }
     else {
+        local N_before = _N
         quietly drop if `out' == 0
+        local N_deleted = `N_before' - _N
     }
 
     // ---- report ---------------------------------------------------------------
@@ -566,6 +628,9 @@ program define xsamplefe, rclass byable(onecall)
         as txt "  retained " as res %12.0fc `N_frame_retained' ///
         as txt "  outside if/in " as res %10.0fc `N_outside' ///
         as txt "  ineligible " as res %10.0fc `N_ineligible'
+    if (`has_weight') {
+        di as txt "  observations are counted with the frequency weights " as res strtrim(substr(`"`wexp'"', 2, .))
+    }
     if (`nby' > 0 | "`mobstrata'" != "") {
         local strata_lbl "by(`by')"
         if ("`mobstrata'" != "") local strata_lbl "`strata_lbl' x mobility class"
@@ -623,8 +688,12 @@ program define xsamplefe, rclass byable(onecall)
     if ("`generate'" != "") {
         di as txt "  indicator saved in " as res "`generate'" as txt " (1 = retained); no observations dropped"
     }
+    else if (`has_weight') {
+        di as txt "  (" as res %12.0fc `N_deleted' as txt " observations in memory deleted, standing for " ///
+            as res trim(string(`N_total' - `N_retained', "%21.0fc")) as txt ")"
+    }
     else {
-        di as txt "  (" as res %12.0fc `N_total' - `N_retained' as txt " observations deleted)"
+        di as txt "  (" as res %12.0fc `N_deleted' as txt " observations deleted)"
     }
 
     // ---- stored results -------------------------------------------------------
@@ -682,6 +751,8 @@ program define xsamplefe, rclass byable(onecall)
     else return scalar pct = `exp'
     return scalar n_uniforms = `nu'
     return local rngstate `"`rngstate'"'
+    return local wtype "`wtype'"
+    return local wexp `"`wexp'"'
     return local frame_rule "`frame_rule'"
     return local grouprule "`grouprule'"
     return local reconrule "`reconrule'"

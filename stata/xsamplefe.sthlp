@@ -1,5 +1,5 @@
 {smcl}
-{* *! version 1.3.0  24sep2026}{...}
+{* *! version 1.4.0  25sep2026}{...}
 {vieweralsosee "[D] sample" "help sample"}{...}
 {vieweralsosee "[R] bsample" "help bsample"}{...}
 {vieweralsosee "" "--"}{...}
@@ -10,6 +10,7 @@
 {viewerjumpto "The command at a glance" "xsamplefe##map"}{...}
 {viewerjumpto "Description" "xsamplefe##description"}{...}
 {viewerjumpto "Sampling units" "xsamplefe##units"}{...}
+{viewerjumpto "Frequency weights" "xsamplefe##fweights"}{...}
 {viewerjumpto "Reproducibility" "xsamplefe##reproducibility"}{...}
 {viewerjumpto "Mobility fidelity" "xsamplefe##mobility"}{...}
 {viewerjumpto "Connectivity" "xsamplefe##connectivity"}{...}
@@ -29,10 +30,10 @@
 {title:Syntax}
 
 {p 8 15 2}
-{cmd:xsamplefe} {it:#} {ifin} [{cmd:,} {it:options}]
+{cmd:xsamplefe} {it:#} {ifin} [{it:{help xsamplefe##fweights:weight}}] [{cmd:,} {it:options}]
 
 {p 8 15 2}
-{cmd:by} {varlist}{cmd::} {cmd:xsamplefe} {it:#} [{cmd:,} {it:options}]
+{cmd:by} {varlist}{cmd::} {cmd:xsamplefe} {it:#} [{it:{help xsamplefe##fweights:weight}}] [{cmd:,} {it:options}]
 
 {synoptset 24 tabbed}{...}
 {synopthdr}
@@ -86,6 +87,7 @@
 {it:#} is a percentage between 0 and 100 unless {opt count} is specified.
 {cmd:by} is allowed as a prefix (equivalent to {opt by()}); see {manhelp by D}.
 Observations not meeting the optional {it:if}/{it:in} criteria are kept (sampled at 100 percent), as in {helpb sample}.
+{cmd:fweight}s are allowed with a sampling unit; see {help xsamplefe##fweights:Frequency weights}.
 
 
 {marker map}{...}
@@ -184,7 +186,8 @@ a compatible compiled plugin; neither estimator is needed to draw a sample.
 The plugin uses 32-bit row and graph indices: datasets of 2,147,483,647 or more
 observations are refused, as are graphs whose number of units plus mobility
 values exceeds 2,147,483,647. All data must fit in Stata's memory, with additional
-memory for keys and indices. {opt minmovers()} stops with an error if pruning
+memory for keys and indices; larger data can be sampled through a table of their
+distinct rows with {help xsamplefe##fweights:frequency weights}. {opt minmovers()} stops with an error if pruning
 exceeds 10,000 passes; a successful call has reached the stated fixed point.
 
 {pstd}
@@ -217,7 +220,11 @@ a group are never separated, whichever unit is sampled.{p_end}
 {pstd}
 All the work is done by a C++ plugin ({cmd:xsamplefe.plugin}) that uses
 OpenMP and has no external dependencies (no DLL or shared library besides the
-compiler runtime). The result never depends on the number of threads.
+compiler runtime). The result never depends on the number of threads. A plugin
+stays loaded until Stata exits, and {cmd:discard} reloads only the ado-file: after
+updating or rebuilding {cmd:xsamplefe} in a session where it has already run,
+restart Stata. {cmd:xsamplefe} refuses to run on a plugin of another release
+(r(498)).
 
 
 {marker units}{...}
@@ -309,6 +316,36 @@ with {opt connectivity} (implied by {opt connected} and {opt reconnect}) and
 for {opt reconnect}.
 
 
+{marker fweights}{...}
+{title:Frequency weights}
+
+{pstd}
+With {cmd:[fweight=}{it:exp}{cmd:]} every observation stands for {it:exp} identical observations, and
+{cmd:xsamplefe} returns what it returns on the data after {cmd:expand} {it:exp}: the same units are drawn
+and retained, every rule that counts observations counts sums of weights ({opt minobs()}, {opt maxobs()},
+{opt connected}, {opt reconnect}, {opt connectivity}), and so does every count of observations in
+{cmd:r()}. Counts of units, periods, {opt mobility()} values and groups do not change. The indicator of
+{opt generate()} applies to each observation in memory; without {opt generate()} the observations that are
+not retained are deleted.
+
+{pstd}
+This is how a sample is drawn from data too large for memory: build a table with one observation per
+distinct combination of the variables the command uses (the unit, {opt by()}, {opt time()},
+{opt mobility()}, {opt group()} and the variables of the {it:if} expression) and the number of observations
+it stands for, with {helpb contract} or with an out-of-core engine (for example {cmd:parqit contract}); draw
+on that table with the counts as frequency weights; then keep, in the full data, the units retained (a
+merge on the unit, or on the group when {opt group()} differs from it).
+
+{pstd}
+Weights require a sampling unit: observation-level sampling draws every observation on its own, and the
+{helpb sample} parity it guarantees has no weighted counterpart. Weights must be positive integers in every
+observation; zero and missing weights are refused rather than excluded, because an excluded observation
+would fall outside the frame and be kept. Two things follow the observations in memory, not their weights:
+{it:in} ranges, and the uniform keys, which are drawn over the observations in memory. {cmd:r(n_uniforms)}
+and the random-number state after the call therefore differ from those on the expanded data; the draw does
+not, because unit-level draws depend only on the set of unit values.
+
+
 {marker reproducibility}{...}
 {title:Reproducibility}
 
@@ -327,6 +364,13 @@ stratum. Consequently, after {cmd:set seed} {it:#}:
 smallest unit value receives the {it:r}-th draw). Changing row order leaves the draw unchanged. Changing the number
 of rows per unit does too when eligibility, strata and the subsequent retention rules stay the same;{p_end}
 {p 8 12 2}- results are invariant to {opt numthreads()}.{p_end}
+
+{pstd}
+The number drawn in a stratum, {cmd:int(n*#/100+.5)}, is computed as Stata
+evaluates that expression, that is {it:n}*(#/100). Before version 1.4.0 it was
+computed as ({it:n}*#)/100, which draws one more observation or unit when that
+product is exactly a half and {it:n}*(#/100) falls just below it: 29 percent of
+50 was 15 instead of the 14 that {cmd:sample} and {cmd:sample2} draw.
 
 {pstd}
 Failed plugin calls, including split-frame or inconsistent-stratum errors, and
@@ -818,6 +862,10 @@ population (and can therefore be much larger than 10 percent){p_end}
 {pstd}Worker-firm groups in long format (one row per group member): 10 percent of the firms with all their groups{p_end}
 {phang2}{cmd:. xsamplefe 10, absorb(p_ntrab ntrab) group(p_groupid) individual(p_ntrab) unit(ntrab)}{p_end}
 
+{pstd}A table of the distinct worker-firm cells and the number of observations in each (from {helpb contract}, or
+from an engine working on disk) draws the sample of the full data; the retained workers are then kept there{p_end}
+{phang2}{cmd:. xsamplefe 10 [fw=n], unit(worker) mobility(firm) minobs(12) connected generate(keep)}{p_end}
+
 
 {marker results}{...}
 {title:Stored results}
@@ -883,7 +931,9 @@ movers-per-value results ({cmd:r(movers_per_mob_frame)},
 {cmd:r(weak_mob_share)}) unless {opt connectivity} or {opt minmovers()} was. Zero
 means zero. {cmd:r(n_components)} keeps its own meaning: the components found
 by {opt connected}, zero without it. The three {cmd:r(N_movers_*)} counts are
-also zero without a mobility dimension.
+also zero without a mobility dimension. With frequency weights, every count of
+observations (the {cmd:r(N*)} results that count observations, and the shares
+measured in rows) is a sum of weights.
 
 {p2col 5 26 30 2: Macros}{p_end}
 {synopt:{cmd:r(cmd)}}{cmd:xsamplefe}{p_end}
@@ -891,6 +941,7 @@ also zero without a mobility dimension.
 {synopt:{cmd:r(frame_rule)}, {cmd:r(grouprule)}, {cmd:r(reconrule)}}{cmd:strict}/{cmd:any}/{cmd:all}, the group closure
 rule and the {opt reconnect} frontier rule{p_end}
 {synopt:{cmd:r(generate)}}indicator variable, if any{p_end}
+{synopt:{cmd:r(wtype)}, {cmd:r(wexp)}}{cmd:fweight} and {cmd:=} {it:exp} when frequency weights are specified{p_end}
 {synopt:{cmd:r(rngstate)}}random-number state before drawing{p_end}
 {p2colreset}{...}
 

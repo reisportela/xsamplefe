@@ -151,6 +151,22 @@ quietly count if __f & g
 assert r(N) == `k_sample2'
 noi di as text "  sample2 cluster(): whole clusters, same number of clusters drawn"
 
+* 29 percent of 50 clusters: (50*29)/100 is 14.5 but Stata evaluates 50*(29/100)
+clear
+quietly set obs 50
+gen long id = _n
+expand 3
+set seed 6
+sample2 29, cluster(id) keep(k)
+bysort id: gen byte __f = _n == 1
+quietly count if __f & k
+local k_sample2 = r(N)
+assert `k_sample2' == 14
+set seed 6
+xsamplefe 29, unit(id) generate(g)
+assert r(N_units_sampled) == `k_sample2'
+noi di as text "  sample2 cluster(): 29 percent of 50 clusters is 14 in both"
+
 * the sampling frame under any / all / strict is the same set of rows:
 * at 0 percent keep()/generate() flag exactly the rows outside the frame
 webuse nlswork, clear

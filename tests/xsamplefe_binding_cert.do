@@ -38,4 +38,22 @@ adopath - "`output'/plugin_alternate"
 discard
 xsamplefe 50, unit(worker) seed(1) generate(original) numthreads(1)
 assert original == reference
+
+* A new file at the same path (as net install and the build script leave it)
+* does not replace the plugin already loaded; with the same release the
+* handshake passes and the draw is unchanged. An older release is refused with
+* r(498) (checked by hand with 1.3.0; no older binary ships with the tests).
+mkdir "`output'/plugin_same"
+copy "`source'/xsamplefe.ado" "`output'/plugin_same/xsamplefe.ado"
+copy "`source'/xsamplefe.plugin" "`output'/plugin_same/xsamplefe.plugin"
+adopath ++ "`output'/plugin_same"
+discard
+xsamplefe 50, unit(worker) seed(1) generate(same_before) numthreads(1)
+erase "`output'/plugin_same/xsamplefe.plugin"
+copy "`source'/xsamplefe.plugin" "`output'/plugin_same/xsamplefe.plugin"
+discard
+xsamplefe 50, unit(worker) seed(1) generate(same_after) numthreads(1)
+assert same_before == reference & same_after == reference
+adopath - "`output'/plugin_same"
+discard
 noi di as result "XSAMPLEFE PLUGIN BINDING CERTIFICATION PASSED"
