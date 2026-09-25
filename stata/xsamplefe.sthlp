@@ -1,5 +1,5 @@
 {smcl}
-{* *! version 1.4.1  25sep2026}{...}
+{* *! version 1.4.2  25sep2026}{...}
 {vieweralsosee "[D] sample" "help sample"}{...}
 {vieweralsosee "[R] bsample" "help bsample"}{...}
 {vieweralsosee "" "--"}{...}
@@ -225,6 +225,15 @@ stays loaded until Stata exits, and {cmd:discard} reloads only the ado-file: aft
 updating or rebuilding {cmd:xsamplefe} in a session where it has already run,
 restart Stata. {cmd:xsamplefe} refuses to run on a plugin of another release
 (r(498)).
+
+{pstd}
+On Linux, the released plugin needs glibc 2.28 and the C++ runtime of GCC 8 or
+newer (RHEL 8, Ubuntu 20.04 and later systems) and the OpenMP runtime
+{cmd:libgomp.so.1} (package {cmd:libgomp} or {cmd:libgomp1}); releases up to
+1.4.0 needed the C++ runtime of GCC 11. If Stata reports that
+{cmd:xsamplefe.plugin} could not be loaded, run {cmd:ldd} on the installed file
+({cmd:findfile xsamplefe.plugin} gives its path) in a terminal: each line with
+{cmd:not found} names what is missing.
 
 
 {marker units}{...}

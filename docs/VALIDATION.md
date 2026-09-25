@@ -295,3 +295,10 @@ exact Linux binary from the workflow and compares its draws with the 1.4.0
 binary; the release notes record the result. When the plugin cannot be loaded
 on Linux, the ado now suggests `ldd`, which names the missing library or symbol
 version; the random-number state and the data are left as they were.
+
+## 1.4.2: the Linux requirements in the README and the help
+
+Documentation only: the README and the help now state the Linux requirements
+of the 1.4.1 build and the `ldd` check, as INSTALL.md does. Apart from the
+release number that the plugin reports to the ado (10402), the source is that
+of 1.4.1, built by the same workflow.

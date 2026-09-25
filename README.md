@@ -41,7 +41,12 @@ restart Stata: `discard` reloads the ado-file but not the plugin, and
 `xsamplefe` refuses to run on a plugin of another release (r(498)).
 Stata selects the binary for Linux x86-64, Windows x86-64,
 macOS Apple Silicon, or macOS Intel. No compiler is needed; Mac releases include
-OpenMP, and Windows compiler runtimes are linked statically. See
+OpenMP, and Windows compiler runtimes are linked statically. The Linux plugin
+loads on RHEL 8, Ubuntu 20.04 and newer systems with the OpenMP runtime
+`libgomp.so.1`; releases up to 1.4.0 needed the libstdc++ of GCC 11 (RHEL 9,
+Ubuntu 22.04). If Stata reports that `xsamplefe.plugin` could not be loaded,
+run `ldd` on the installed file (`findfile xsamplefe.plugin` gives its path):
+each `not found` line names what is missing. See
 [INSTALL.md](INSTALL.md) for system requirements and local installation.
 Drawing samples does not require `reghdfe` or `xhdfe`.
 
@@ -342,8 +347,11 @@ above to retrieve the tutorials and `xsamplefe_check.do` into the current direct
 
 The release binaries are built online by GitHub Actions on Linux, Windows,
 Mac Intel and Mac ARM runners. Each runner loads its plugin and exercises the
-Stata plugin interface, including OpenMP, before packaging. Native Stata
-certification is performed separately on the Linux release binary.
+Stata plugin interface, including OpenMP, before packaging. The Linux plugin is
+built on AlmaLinux 8 with `gcc-toolset-13`; the workflow rejects it above
+`GLIBC_2.28`/`GLIBCXX_3.4.25` and loads it on AlmaLinux 8 and Ubuntu 20.04 with
+their own runtimes. Native Stata certification is performed separately on the
+Linux release binary.
 
 To build your own binary, use the matching command on a machine with the required
 compiler and SDK:

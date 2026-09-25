@@ -1,4 +1,4 @@
-*! version 1.4.1  25sep2026
+*! version 1.4.2  25sep2026
 *! xsamplefe: panel / fixed-effect aware random sampling for reghdfe and xhdfe
 *! - sample / sample2 semantics for the simple cases (drawn rows are
 *!   bit-identical to sample under the same seed and data order)
@@ -552,7 +552,7 @@ program define xsamplefe, rclass byable(onecall)
     }
     global XSAMPLEFE_PLUGIN_PATH_INTERNAL "`plugin_path'"
 
-    // the plugin reports its release in local xsf_plugin_version (10401 = 1.4.1);
+    // the plugin reports its release in local xsf_plugin_version (10402 = 1.4.2);
     // releases before 1.4.0 report nothing
     local xsf_plugin_version
     capture noisily plugin call `plugin_prog' `touse' `unit_use' `by_use' `time_use' ///
@@ -570,7 +570,7 @@ program define xsamplefe, rclass byable(onecall)
         threads_requested threads_effective threads_used openmp_enabled thread_capacity
     // a plugin loaded earlier in the session stays in use after net install, a
     // rebuild or discard, so one of another release must be refused here
-    if ("`xsf_plugin_version'" != "10401") {
+    if ("`xsf_plugin_version'" != "10402") {
         foreach s of local scalars {
             capture scalar drop `sp'`s'
         }
