@@ -2,10 +2,13 @@
 #include "stplugin.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
@@ -43,6 +46,20 @@ int macro_save(char* name, char* value) { macros[name] = value; return 0; }
 void require(bool ok, const std::string& why) { if (!ok) throw std::runtime_error(why); }
 double scalar(const char* name) { return scalars.at(std::string("probe_") + name); }
 using Call = ST_retcode (*)(int, char*[]);
+
+// The documented order of units that tie on the first key, written again here:
+// a hash of the key and of the unit's rank, then the rank.
+std::uint64_t mix(std::uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+std::uint64_t bits(double d) {
+    std::uint64_t b = 0;
+    std::memcpy(&b, &d, sizeof(b));
+    return b;
+}
 
 void run(Call call, Columns input, const std::string& config, int threads) {
     data = std::move(input); scalars.clear(); macros.clear(); error.clear();
@@ -119,6 +136,19 @@ int main(int argc, char** argv) {
             require(data.back() == std::vector<double>({1,1,0,1}) && scalar("N_total") == 9 &&
                         scalar("N_retained") == 8 && scalar("N_ineligible") == 1 && scalar("U_eligible") == 2,
                     "frequency weights are not counted as rows");
+            // eight units tied on the first key, four drawn: those with the
+            // smallest hash, which are not the four of the smallest rank
+            const double tie = .5;
+            std::vector<std::pair<std::uint64_t, int>> order;
+            for (int r = 0; r < 8; ++r) order.emplace_back(mix(bits(tie) ^ mix(static_cast<std::uint64_t>(r))), r);
+            std::sort(order.begin(), order.end());
+            std::vector<double> drawn(8, 0);
+            for (int k = 0; k < 4; ++k) drawn[static_cast<std::size_t>(order[static_cast<std::size_t>(k)].second)] = 1;
+            require(drawn != std::vector<double>({1,1,1,1,0,0,0,0}), "this tie does not tell the hash from the rank");
+            run(call, {std::vector<double>(8,1),{10,20,30,40,50,60,70,80},std::vector<double>(8,tie),
+                       std::vector<double>(8,.5),std::vector<double>(8,7)},
+                "is_count=0;pct=50;has_unit=1;nby=0;has_time=0;has_mob=0;has_group=0;nu=2", threads);
+            require(data.back() == drawn, "tied unit keys are not drawn in the order of the hash");
         }
         std::cout << "XSAMPLEFE NATIVE PLUGIN SPI TEST PASSED\n";
         return 0;

@@ -21,6 +21,13 @@ def collect(platform, out):
     shutil.copy2(ROOT / "stata" / plugin.name, plugin)
     receipt = {"platform": platform, "git_commit": os.environ.get("GITHUB_SHA", "local"),
                "plugin": plugin.name, "validation": "native SPI probe required"}
+    # the build script's own record: which compiler built this binary, and when
+    record = ROOT / "stata" / (plugin.name + ".build.txt")
+    if record.exists():
+        for line in record.read_text().splitlines():
+            key, _, value = line.partition("=")
+            if key in ("compiler", "built_utc", "openmp", "march_native"):
+                receipt[key] = value
     if platform.startswith("mac"):
         arch = "arm64" if platform == "macarm64" else "x86_64"
         prefix = Path(command("brew", "--prefix", "libomp"))

@@ -27,7 +27,7 @@ on the model, missing data, identifying variation, and the sampling design.
 
 ## Install the latest release
 
-In Stata 14 or newer, run:
+In Stata 14.1 or newer, run:
 
 ```stata
 net install xsamplefe, from("https://github.com/reisportela/xsamplefe/releases/latest/download") replace
@@ -46,7 +46,8 @@ loads on RHEL 8, Ubuntu 20.04 and newer systems with the OpenMP runtime
 `libgomp.so.1`; releases up to 1.4.0 needed the libstdc++ of GCC 11 (RHEL 9,
 Ubuntu 22.04). If Stata reports that `xsamplefe.plugin` could not be loaded,
 run `ldd` on the installed file (`findfile xsamplefe.plugin` gives its path):
-each `not found` line names what is missing. See
+each `not found` line names what is missing. The Mac plugins need macOS 14 or
+newer on Apple Silicon and macOS 15 or newer on Intel. See
 [INSTALL.md](INSTALL.md) for system requirements and local installation.
 Drawing samples does not require `reghdfe` or `xhdfe`.
 
@@ -145,7 +146,7 @@ by varlist: xsamplefe # [fweight] [, options] same as by(varlist)
 | Panel structure | `time(varname)` (default: the `xtset` time variable), `balanced`, `minperiods(#)`, `maxperiods(#)`, `minobs(#)`, `maxobs(#)` |
 | Mobility structure | `mobility(varname)`, `minmobility(#)`, `maxmobility(#)`, `movers(#)`, `stayers(#)`, `mobstrata`, `connectivity`, `connected`, `minmovers(#)`, `reconnect` / `recontarget(#)` / `reconrule(gain|key)` |
 | `if`/`in` and groups | `any`, `all` (units split by `if`/`in`; strict = error by default), `grouprule(any|all)` |
-| Performance | `numthreads(#)` (0 = runtime default; `r(threads_used)` reports the team formed), `verbose` (per-phase timings), `pduplicates(#)` (number of uniform key columns, as in `sample`) |
+| Performance | `numthreads(#)` (0 = runtime default, the whole machine; use `numthreads(1)` on small data, in loops and on shared servers; `r(threads_used)` reports the team formed), `verbose` (per-phase timings), `pduplicates(#)` (number of uniform key columns, as in `sample`) |
 
 Stored results (`r()`): retained / frame / outside / ineligible observations,
 units in the frame / eligible / ineligible / sampled / retained / partially
@@ -398,7 +399,14 @@ bash tests/run_tests.sh                     # needs Stata, reghdfe and sample2
 XSAMPLEFE_BUILD_PLUGIN=1 bash tests/run_tests.sh
 XHDFE_ADOPATH=/path/to/xhdfe/stata bash tests/run_tests.sh   # adds the reghdfe/xhdfe comparison
 bash tests/selftest.sh                      # checks that the harness reports a failure
+bash tests/audit/run_audit.sh 2000          # optional: random designs against a reference
 ```
+
+On Linux `run_tests.sh` records, in `runtime.txt` beside the log, the OpenMP
+runtime that the plugin resolves to, and refuses one that is not GNU `libgomp`
+(`LD_LIBRARY_PATH` can put another library under the name `libgomp.so.1`, as
+NVIDIA's HPC SDK does): run it with `env -u LD_LIBRARY_PATH`, or set
+`XSAMPLEFE_ALLOW_OPENMP_SUBSTITUTE=1` to certify that runtime knowingly.
 
 `run_tests.sh` first lints the help file (no SMCL source line over 160 bytes,
 balanced braces on every line): Stata's GUI Viewer truncates lines at 245
@@ -444,7 +452,10 @@ component computation and `reconnect` on a deliberately sparse graph.
 restoration, 140 native-sample comparisons, actual 1/8/48-thread teams, and a
 disconnected all-stayer case where reconnect cannot attain its target.
 `xsamplefe_binding_cert.do` verifies missing binaries, changed plugin locations,
-and rebinding after `discard`, in copies under the run's output directory.
+rebinding after `discard` and a call after `macro drop _all`, in copies under
+the run's output directory. `tests/audit/` is separate from the certification:
+it draws random designs and compares the indicator and the stored results with
+a reference implementation written from the help (see its README).
 Statistical assertions in these files concern the particular simulated designs;
 they do not establish unbiased estimation for arbitrary data or models.
 Local benchmark datasets, exploratory tests and audit working notes are excluded

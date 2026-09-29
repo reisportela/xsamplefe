@@ -70,7 +70,7 @@ local b_obs = _b[x]
 local se_obs = _se[x]
 assert e(num_singletons) > 0
 assert e(N) < 4800
-assert `se_obs' > `se_unit'
+assert `se_obs' > `se_unit' & `se_obs' < .
 noi di as text "  AKM 20% of rows:    b = " %8.5f `b_obs' " (se " %7.5f `se_obs' ") after " ///
     e(num_singletons) " singletons dropped"
 
@@ -111,7 +111,7 @@ local sd = r(sd)
 assert abs(`bias') < 3 * `sd' / sqrt(100)
 quietly summarize covered
 local coverage = r(mean)
-assert `coverage' >= .90
+assert inrange(`coverage', .90, 1)
 quietly summarize se
 local se_mean = r(mean)
 * the spread of the sample estimates is the one the standard errors announce
@@ -242,10 +242,10 @@ foreach p in 25 10 {
     assert abs(r(cov2) / `cov_pop' - 1) < .10
 }
 * the estimator degrades with the movers per firm
-assert `mpm_pop' > `mpm25' & `mpm25' > `mpm10'
+assert `mpm_pop' > `mpm25' & `mpm25' > `mpm10' & `mpm_pop' < .
 assert `ratio_pop' < `ratio25' & `ratio25' < `ratio10'
 assert inrange(`ratio25', 1.05, 1.45) & inrange(`ratio10', 1.35, 2.20)
-assert `weak10' > .10
+assert inrange(`weak10', .10, 1)
 
 * observation-level sampling of the same size is far worse and even flips the
 * sign of the covariance
@@ -254,7 +254,7 @@ set seed 1
 quietly sample 10
 xcert_vardec, tag("10% of rows")
 assert r(mpm) < `mpm10'
-assert r(ratio) > 3 & r(ratio) > `ratio10'
+assert r(ratio) > 3 & r(ratio) > `ratio10' & r(ratio) < .
 assert r(cov2_hat) < 0
 
 * keeping every mover restores an unbiased decomposition, of a different
@@ -267,5 +267,20 @@ xcert_vardec, tag("movers(100) stayers(10)")
 assert r(ratio) < 1.15
 assert abs(r(cov2) / `cov_pop' - 1) > .20
 noi di as text "  AKM decomposition: sampling keeps the parameters, the estimator loses precision"
+
+* minmovers() on the same panel, with the numbers the help quotes: 17 percent
+* of the firms of a 10 percent draw have at most one mover; minmovers(2) drops
+* 110 of its 600 workers and leaves none of those firms; minmovers(3) empties it
+use `lam', clear
+set seed 1
+quietly xsamplefe 10, absorb(worker firm year) connectivity generate(plain)
+assert r(N_units_sampled) == 600 & abs(r(weak_mob_share) - .17) < .005
+set seed 1
+quietly xsamplefe 10, absorb(worker firm year) minmovers(2) generate(mm2)
+assert r(N_units_minmovers_dropped) == 110 & r(N_units_retained) == 490 & r(weak_mob_share) == 0
+set seed 1
+quietly xsamplefe 10, absorb(worker firm year) minmovers(3) generate(mm3)
+assert r(N_units_retained) == 0 & mm3 == 0
+noi di as text "  minmovers() on the calibrated panel: 110 of 600 units, as the help says"
 
 noi di as text "xsamplefe estimation certification passed"

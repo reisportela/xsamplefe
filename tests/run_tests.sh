@@ -13,6 +13,9 @@
 # Requires reghdfe and sample2 (net install dm46, from(http://www.stata.com/stb/stb37)).
 # XSAMPLEFE_FIXTURE_DIR may contain nlswork.dta for offline certification.
 # XSAMPLEFE_TEST_OUTDIR selects a new output directory; an existing log is refused.
+#   XSAMPLEFE_ALLOW_OPENMP_SUBSTITUTE=1  accept an OpenMP runtime other than GNU
+#                                      libgomp under the name libgomp.so.1 (Linux);
+#                                      the runtime is recorded in runtime.txt
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -78,6 +81,32 @@ if [[ -e "${OUT_DIR}/testall.do" ]]; then
   echo "Refusing to overwrite an existing test driver: ${OUT_DIR}/testall.do" >&2
   exit 1
 fi
+
+# The plugin needs libgomp.so.1, and LD_LIBRARY_PATH can put another runtime
+# under that name (NVIDIA's libnvomp does). What the plugin resolves to in this
+# environment is recorded beside the log, and a substitute is refused unless
+# asked for: the certification is of the runtime the users have.
+RUNTIME="not checked (the check is for Linux)"
+PLUGIN_FILE="${XSAMPLEFE_ADOPATH}/xsamplefe.plugin"
+if [[ "$(uname -s)" == Linux && -f "${PLUGIN_FILE}" ]] && command -v ldd >/dev/null 2>&1; then
+  resolved="$(ldd "${PLUGIN_FILE}" 2>/dev/null | awk '$1 == "libgomp.so.1" { print $3 }')"
+  if [[ -n "${resolved}" && -e "${resolved}" ]]; then
+    real="$(readlink -f -- "${resolved}")"
+    RUNTIME="libgomp.so.1 => ${real}"
+    if [[ "$(basename -- "${real}")" != libgomp.so* ]]; then
+      if [[ "${XSAMPLEFE_ALLOW_OPENMP_SUBSTITUTE:-0}" != 1 ]]; then
+        echo "The plugin's libgomp.so.1 resolves to ${real}, which is not GNU libgomp." >&2
+        echo "Run 'env -u LD_LIBRARY_PATH bash tests/run_tests.sh', or set XSAMPLEFE_ALLOW_OPENMP_SUBSTITUTE=1." >&2
+        exit 1
+      fi
+      RUNTIME="${RUNTIME} (a substitute for GNU libgomp, accepted on request)"
+    fi
+  else
+    RUNTIME="libgomp.so.1 not resolved by ldd"
+  fi
+fi
+printf 'plugin: %s\nopenmp runtime: %s\n' "${PLUGIN_FILE}" "${RUNTIME}" > "${OUT_DIR}/runtime.txt"
+echo "xsamplefe OpenMP runtime: ${RUNTIME}"
 cp "${SCRIPT_DIR}/testall.do" "${OUT_DIR}/testall.do"
 echo "xsamplefe certification log: ${LOG_FILE}"
 export XSAMPLEFE_TEST_OUTDIR="${OUT_DIR}"

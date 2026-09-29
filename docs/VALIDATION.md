@@ -302,3 +302,81 @@ Documentation only: the README and the help now state the Linux requirements
 of the 1.4.1 build and the `ldd` check, as INSTALL.md does. Apart from the
 release number that the plugin reports to the ado (10402), the source is that
 of 1.4.1, built by the same workflow.
+
+## 1.4.3: corrections after an independent audit
+
+An adversarial, read-only audit of the public 1.4.2 release (29 September 2026)
+found no defect in the sampling. With StataNow/MP 19.5 on Linux:
+
+- Observation-level sampling retained the rows of `sample` and left the same
+  random-number state in about 24,000 pairs of calls: the `mt64`, `kiss32` and
+  `mt64s` generators, caller versions 7 to 19, percentages and stratum sizes
+  from 1 to 2,500 and above 10^6, frequent ties on `float` keys, and
+  `pduplicates()` up to 33 key columns.
+- A reference implementation written from the help agreed with the release in
+  21,000 random unit-level designs: the indicator row by row and 45 stored
+  results in the 16,818 designs that draw, the expected error and the restored
+  random-number state in the others. It is now in `tests/audit/`.
+- The draw was the same with 1, 2, 3, 8, 17 and 48 threads and with shuffled
+  rows; `valgrind` reported no memory error in 1,600 designs replayed outside
+  Stata.
+- The benchmark figures and the limited-mobility table of the help were
+  reproduced, except the `minmovers(2)` count corrected below.
+
+What the audit did find, and what 1.4.3 changes:
+
+- **Stata 14.1, not 14.** The ado called `log1m()`, a function added by the
+  Stata 15 update of 7 August 2018, so every call that draws would stop on an
+  older Stata. It now falls back on `ln(1 - p)` where `log1m()` does not
+  exist: the number of key columns is the same for `pduplicates()` of 1e-16
+  or more, the default included, and differs below that, where 1 - p rounds
+  to 1. The plugin uses the interface that Stata 14.1 introduced, so 14.1 is
+  the minimum and the ado declares it. Only Stata 19.5 was run: the fallback
+  itself, and parity with the `sample` of those versions, were not.
+- **A call after `macro drop _all`** was refused with r(498): the path of the
+  plugin still bound was kept in a global only. It is kept in Mata as well.
+- **`generate()` names that cannot be given** (`str5`, the names of Stata's
+  temporary variables) were found out after the draw, with the random-number
+  state advanced. They are refused before anything is drawn.
+- **Numbers in forms that `strtod` does not read** (`1.8X+005`, `1d2`,
+  underflows such as `1e-320`) were refused by the plugin where `sample`
+  accepts them. They now give the value `sample` reads.
+- **A group with a missing `unit()` value** stopped with a message about
+  `if`/`in` where there was none. The message names the cause, and the help
+  says that `any` cannot resolve it.
+- **The `xtset` time variable as default mobility dimension** is now announced
+  by a note. The rule itself is unchanged.
+- **Help.** `minmovers(2)` drops 110 of the 600 units of a 10 percent draw of
+  the calibrated panel; "46 of 300" belonged to another panel. The help and the
+  README now give the minimum macOS versions and advise `numthreads(1)` on
+  small data: the default team is the whole machine, and on a shared 48-core
+  host a call on 74 rows took 256 ms with it and 0.9 ms with one thread.
+
+The certification suite was itself audited, with 36 deliberate defects built
+one at a time from the 1.4.2 source:
+
+- It detected 29. Five real defects passed it: the bounds of `minmovers()` and
+  `maxobs()`, stale gains in `reconnect`, `r(lcc_units_share)` and
+  `r(N_movers_retained)`. A sixth, unit ties settled by rank instead of the
+  documented hash, passed because the test meant for it ran on an empty
+  dataset: `drop` of the only variable had removed the observations, and both
+  assertions were null. The seventh is equivalent to the original while the
+  two products it compares stay below 2^53, about 9 x 10^13 weighted rows.
+- The suite now detects 35 of the 36, all but the equivalent one. It gained
+  inclusive-bound tests for the six eligibility bounds and for `minmovers()`,
+  a graph built by hand on which the gain of a unit must be recomputed, the
+  three shares of the largest component and the retained movers against counts
+  made in Stata, the tie rule on a million units and in the native test of the
+  four platforms, and the figures the help quotes for `minmovers()`. Asserts
+  that a missing result would satisfy were bounded.
+
+On Linux `tests/run_tests.sh` now records the OpenMP runtime that the plugin
+resolves to and refuses one that is not GNU `libgomp`. On the validation host
+`LD_LIBRARY_PATH` put NVIDIA's `libnvomp` under the name `libgomp.so.1`, and
+the Stata certifications and timings of the earlier releases ran with it; the
+native tests of the release workflow ran with GNU `libgomp`. The audit repeated
+the certification and 12,000 designs with GNU `libgomp`, with the same results.
+
+Not covered: execution inside Stata on Windows and Mac, Stata versions other
+than 19.5, and races that would need a thread checker able to see the OpenMP
+runtime. The default thread team and the minimum macOS versions are unchanged.

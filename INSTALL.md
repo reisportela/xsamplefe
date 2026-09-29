@@ -2,7 +2,7 @@
 
 ## Install or update from GitHub
 
-In Stata 14 or newer:
+In Stata 14.1 or newer (the plugin uses the interface that Stata 14.1 introduced):
 
 ```stata
 net install xsamplefe, from("https://github.com/reisportela/xsamplefe/releases/latest/download") replace
@@ -213,6 +213,13 @@ xsamplefe. The source checkout's full suite additionally needs
 STATA_BIN=stata-mp bash tests/run_tests.sh      # must end with the success marker
 bash tests/selftest.sh                          # proves the harness fails on a failing assert
 ```
+
+On Linux the suite writes `runtime.txt` beside its log, with the OpenMP runtime
+that the plugin resolves to in that environment, and stops when it is not GNU
+`libgomp`. `LD_LIBRARY_PATH` can put another library under the name
+`libgomp.so.1` (NVIDIA's HPC SDK does): run the suite with
+`env -u LD_LIBRARY_PATH`, or set `XSAMPLEFE_ALLOW_OPENMP_SUBSTITUTE=1` to
+certify that runtime knowingly.
 
 `XSAMPLEFE_BUILD_PLUGIN=1 bash tests/run_tests.sh` rebuilds the plugin first.
 Every run has a new log directory under `tests/output/`. The self-test checks

@@ -293,7 +293,7 @@ capture xsamplefe 10 if year >= 80, absorb(idcode year)
 assert _rc == 198
 set seed 21
 xsamplefe 10 if year >= 80, absorb(idcode year) any generate(fa)
-assert r(N_units_split) > 0
+assert inrange(r(N_units_split), 1, _N)
 bysort idcode: egen byte famn = min(fa)
 bysort idcode: egen byte famx = max(fa)
 assert famn == famx
@@ -326,6 +326,15 @@ foreach bad in _all _n _N _pi _rc _b _se _cons _coef _skip {
     assert _rc == 198
     capture xsamplefe 20, keep(`bad')
     assert _rc == 198
+    assert _N == 10 & c(k) == 3
+}
+* names that pass confirm name and cannot be created (str5), and names of
+* Stata's temporary variables, are refused before anything is drawn
+foreach bad in str1 str5 str2045 strL __000000 __000003 __00000A {
+    set seed 7
+    local state = c(rngstate)
+    capture xsamplefe 20, generate(`bad')
+    assert _rc == 198 & c(rngstate) == "`state'"
     assert _N == 10 & c(k) == 3
 }
 * a new name that abbreviates an existing variable does not touch it
@@ -458,6 +467,17 @@ assert c1 == c2
 set seed 4
 xsamplefe 50, absorb(worker_id firm_id) generate(c3)
 assert c1 == c3
+* ## between two categorical variables is one effect, their interaction, as
+* reghdfe reads it (absorb(a##b) and absorb(a#b) are the same regression)
+set seed 4
+xsamplefe 50, absorb(worker_id##firm_id x) unit(worker_id) generate(c4)
+local abs_double "`r(absorb)'"
+set seed 4
+xsamplefe 50, absorb(worker_id#firm_id x) unit(worker_id) generate(c5)
+assert c4 == c5 & "`abs_double'" == "`r(absorb)'" & "`abs_double'" == "worker_id#firm_id x"
+set seed 4
+xsamplefe 50, absorb(worker_id##firm_id) generate(c6)
+assert "`r(unit)'" == "worker_id#firm_id" & r(N_units) == 20
 * movers()/stayers() counts must be representable
 capture xsamplefe 1, count unit(worker_id) mobility(firm_id) stayers(1e30)
 assert _rc == 198
@@ -798,5 +818,27 @@ replace w = . in 1
 capture xsamplefe 20 [fw=w], unit(worker)
 assert _rc == 402
 noi di as text "  fweights: contract's table with [fw=] equals the rows (17 designs, by prefix), threads, order, 2^31 and 2^53, errors"
+
+* ---------------------------------------------------------------------------
+* 14. Bounds are inclusive: a unit with exactly # rows, periods or mobility
+*     values meets min*(#) and max*(#). Unit u has u of each.
+* ---------------------------------------------------------------------------
+clear
+set obs 4
+gen long u = _n
+expand u
+bysort u: gen int t = _n
+gen int m = t
+forvalues k = 1/4 {
+    foreach o in obs periods mobility {
+        xsamplefe 100, unit(u) time(t) mobility(m) min`o'(`k') generate(s) replace
+        assert r(N_units_eligible) == 5 - `k' & r(N_units_ineligible) == `k' - 1
+        assert s == (u >= `k')
+        xsamplefe 100, unit(u) time(t) mobility(m) max`o'(`k') generate(s) replace
+        assert r(N_units_eligible) == `k' & r(N_units_ineligible) == 4 - `k'
+        assert s == (u <= `k')
+    }
+}
+noi di as text "  bounds: a unit with exactly # rows, periods or mobility values is eligible"
 
 noi di as text "xsamplefe certification passed"

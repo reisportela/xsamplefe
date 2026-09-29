@@ -386,7 +386,69 @@ assert r(n_uniforms) == 7
 xcert_ids
 assert "`ref'" == "`r(ids)'"
 assert c(rngstate) == "`ref_state'"
-noi di as text "  sample: in, missing and string strata, by prefix, pduplicates() parity"
+
+* where log1m() does not exist (before the Stata 15 update of 07aug2018) the
+* ado computes the number of key columns with ln(1 - p): the same number for
+* pduplicates() of 1e-16 or more, the default included
+foreach p in 1e-4 1e-9 1e-16 .5 0 1 {
+    foreach d1 in 32 52 {
+        forvalues e = 0(.5)9.5 {
+            local nobs = int(10^`e')
+            local with = ceil((2 * log(`nobs') - log(-log1m(`p'))) / log(2) - 1)
+            local without = ceil((2 * log(`nobs') - log(-ln(1 - `p'))) / log(2) - 1)
+            assert max(2, ceil(`with' / `d1')) == max(2, ceil(`without' / `d1'))
+        }
+    }
+}
+
+* # in the other forms Stata reads: hexadecimal (48), d exponents (10),
+* and underflows, which sample reads as a subnormal or as zero
+foreach num in 1.8X+005 1d1 4.8e1 1e-320 1e-400 {
+    sysuse auto, clear
+    gen long __id = _n
+    set seed 18
+    sample `num'
+    local ref_n = _N
+    xcert_ids
+    local ref `r(ids)'
+    local ref_state = c(rngstate)
+    sysuse auto, clear
+    gen long __id = _n
+    set seed 18
+    xsamplefe `num'
+    assert _N == `ref_n'
+    xcert_ids
+    assert "`ref'" == "`r(ids)'"
+    assert c(rngstate) == "`ref_state'"
+}
+webuse nlswork, clear
+set seed 19
+xsamplefe 10, absorb(idcode ind_code) movers(1.4000000000000X+006) stayers(1d1) ///
+    recontarget(1.c000000000000X+005) generate(hexadecimal)
+set seed 19
+xsamplefe 10, absorb(idcode ind_code) movers(80) stayers(10) recontarget(56) generate(decimal)
+assert hexadecimal == decimal
+
+* in with by(), which sample refuses: the draw is sample's with the range as if
+foreach range in 20/60 1/1 74/74 5/70 {
+    gettoken first last : range, parse("/")
+    local last = substr("`last'", 2, .)
+    sysuse auto, clear
+    gen long __id = _n
+    set seed 20
+    sample 30 if inrange(_n, `first', `last'), by(foreign)
+    xcert_ids
+    local ref `r(ids)'
+    local ref_state = c(rngstate)
+    sysuse auto, clear
+    gen long __id = _n
+    set seed 20
+    xsamplefe 30 in `range', by(foreign)
+    xcert_ids
+    assert "`ref'" == "`r(ids)'"
+    assert c(rngstate) == "`ref_state'"
+}
+noi di as text "  sample: in, missing and string strata, by prefix, pduplicates(), hexadecimal # parity"
 
 * ---------------------------------------------------------------------------
 * 6. bsample and splitsample: base-Stata cluster sampling on a 100-cluster panel
@@ -508,15 +570,18 @@ local rng "`c(rng_current)'"
 set rng kiss32
 clear
 set obs 1000000
+* u comes first: dropping the only variable would drop the observations too
+gen long u = _n
 set seed 9
 gen double __u1 = runiform()
 quietly duplicates report __u1
 * kiss32 draws 32-bit uniforms: with a million draws the first key does tie
-assert r(N) - r(unique_value) > 0
+assert r(N) == 1000000 & inrange(r(N) - r(unique_value), 1, 1000000)
 drop __u1
-gen long u = _n
+assert _N == 1000000
 set seed 9
 xsamplefe 18703, count unit(u) generate(a) numthreads(1)
+assert r(N_units) == 1000000 & r(N_units_sampled) == 18703
 expand 2 if u == 1
 set seed 9
 xsamplefe 18703, count unit(u) generate(b) numthreads(1)
@@ -524,7 +589,41 @@ assert a == b
 set seed 9
 xsamplefe 18703, count unit(u) generate(c8) numthreads(8)
 assert a == c8
+* the tie is settled by a hash of the key and of the rank, not by the rank
+* alone: with the draw ending on a tied pair, the units below it are drawn,
+* those above it are not, one member of the pair is, and over the first pairs
+* in key order it is sometimes the first member and sometimes the second
+quietly drop if _n > 1000000
+set seed 9
+gen double __u1 = runiform()
+sort __u1 u
+gen long pos = _n
+gen byte pair = __u1 == __u1[_n + 1] & __u1 != __u1[_n - 1] & __u1[_n + 1] != __u1[_n + 2]
+quietly levelsof pos if pair, local(where)
+sort u
+local first 0
+local second 0
+local pairs 0
+foreach p of local where {
+    if (`pairs' == 8) continue, break
+    local ++pairs
+    set seed 9
+    quietly xsamplefe `p', count unit(u) generate(t1) replace numthreads(1)
+    set seed 9
+    quietly xsamplefe `p', count unit(u) generate(t8) replace numthreads(8)
+    assert t1 == t8
+    assert t1 == 1 if pos < `p'
+    assert t1 == 0 if pos > `p' + 1
+    quietly count if t1 == 1 & pos == `p'
+    local first = `first' + r(N)
+    quietly count if t1 == 1 & inlist(pos, `p', `p' + 1)
+    assert r(N) == 1
+    quietly count if t1 == 1 & pos == `p' + 1
+    local second = `second' + r(N)
+}
+assert `pairs' == 8 & `first' + `second' == 8 & `first' > 0 & `second' > 0
 set rng `rng'
-noi di as text "  unit draws: tie-break invariant to the number of rows and to the threads"
+noi di as text "  unit draws: tie-break invariant to the number of rows and to the threads; " ///
+    "of 8 tied pairs the first member is drawn in `first' and the second in `second'"
 
 noi di as text "xsamplefe compatibility certification passed"

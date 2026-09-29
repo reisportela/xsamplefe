@@ -118,7 +118,7 @@ assert r(N_movers_sampled) == r(N_movers_eligible)
 keep if g
 xcert_mob, unit(worker) mob(firm) time(year) prefix(s_)
 assert s_nmob == p_nmob & s_ntrans == p_ntrans
-assert r(movers) > .9
+assert r(movers) > .9 & r(movers) <= 1
 assert r(n1) == int(`n1' * 20 / 100 + .5)
 
 * connected set: the 20 percent worker sample is still one component; at 5
@@ -131,7 +131,7 @@ xsamplefe 20, absorb(worker firm year) connected generate(g20)
 assert r(n_components) == 1 & r(N_connected_dropped) == 0
 set seed 1
 xsamplefe 5, absorb(worker firm year) connected generate(g5)
-assert r(n_components) > 1 & r(N_connected_dropped) > 0
+assert inrange(r(n_components), 2, _N) & inrange(r(N_connected_dropped), 1, _N)
 noi di as text "  connected: 1 component at 100% and 20%; " r(n_components) " components at 5% (" ///
     r(N_connected_dropped) " rows dropped)"
 
@@ -162,7 +162,7 @@ assert r(N_units_sampled) == 30 & r(N_units_retained) == 150
 keep if g
 xcert_mob, unit(worker) mob(firm) time(year) prefix(s_)
 assert s_nmob == p_nmob & s_ntrans == p_ntrans
-assert r(movers) > `movers'
+assert r(movers) > `movers' & r(movers) <= 1
 noi di as text "  20% of firms: movers " %5.3f `movers_firm' "; with group(worker): full histories, movers " ///
     %5.3f r(movers) " (over-represented)"
 
@@ -232,9 +232,25 @@ program define xcert_comp, rclass
         return scalar ncomp = r(N)
         bysort `touse' `lab': gen long `lm' = _N if `touse'
         summarize `lm' if `touse', meanonly
-        return scalar lccrows = r(max)
+        local big = r(max)
+        return scalar lccrows = `big'
         count if `touse'
         return scalar rows = r(N)
+        * units and mobility values, all of them and those of the largest
+        * component, which is one component when nlargest is 1
+        tempvar fu fv
+        count if `f' & `lm' == `big'
+        return scalar nlargest = r(N)
+        bysort `touse' `unit': gen byte `fu' = _n == 1 & `touse'
+        bysort `touse' `mob': gen byte `fv' = _n == 1 & `touse' & !missing(`mob')
+        count if `fu'
+        return scalar units = r(N)
+        count if `fu' & `lm' == `big'
+        return scalar lccunits = r(N)
+        count if `fv'
+        return scalar mobs = r(N)
+        count if `fv' & `lm' == `big'
+        return scalar lccmobs = r(N)
     }
 end
 
@@ -267,10 +283,29 @@ set seed 1
 xsamplefe 10, absorb(worker firm year) connectivity generate(g)
 local share_simple = r(lcc_share)
 local ncomp_simple = r(N_components)
-assert `share_simple' < .10 & `ncomp_simple' > 100
+assert `share_simple' < .10 & inrange(`ncomp_simple', 101, _N)
 xcert_comp if g == 1, unit(worker) mob(firm)
 assert r(ncomp) == `ncomp_simple'
 assert abs(r(lccrows) / r(rows) - `share_simple') < 1e-12
+
+* the shares of the largest component in rows, in units and in mobility
+* values are three numbers when the units differ in their rows: three in ten
+* rows of the panel are left out here
+preserve
+set seed 77
+quietly drop if runiform() < .3
+set seed 1
+xsamplefe 30, absorb(worker firm year) connectivity generate(gthin)
+local sh_rows = r(lcc_share)
+local sh_units = r(lcc_units_share)
+local sh_mobs = r(lcc_mobility_share)
+xcert_comp if gthin == 1, unit(worker) mob(firm)
+assert r(nlargest) == 1
+assert abs(r(lccrows) / r(rows) - `sh_rows') < 1e-12
+assert abs(r(lccunits) / r(units) - `sh_units') < 1e-12
+assert abs(r(lccmobs) / r(mobs) - `sh_mobs') < 1e-12
+assert abs(`sh_units' - `sh_rows') > 1e-4 & abs(`sh_mobs' - `sh_rows') > 1e-4
+restore
 
 * reconnect grows the largest component back to the frame's share
 set seed 1
@@ -278,8 +313,8 @@ xsamplefe 10, absorb(worker firm year) reconnect generate(gr)
 local share_rec = r(lcc_share)
 local added = r(N_units_reconnected)
 local added_rows = r(N_reconnected)
-assert `share_rec' >= `o_share' - .01
-assert `added' > 0 & `added_rows' > 0
+assert inrange(`share_rec', `o_share' - .01, 1)
+assert inrange(`added', 1, 3000) & inrange(`added_rows', 1, _N)
 assert r(N_units_retained) == r(N_units_sampled) + `added'
 assert r(N_frame_retained) == 1800 + `added_rows'
 * whole units only, and every drawn unit is still in the sample
@@ -300,8 +335,8 @@ xsamplefe 10, absorb(worker firm year) reconnect reconrule(key) generate(gk)
 local share_key = r(lcc_share)
 local added_key = r(N_units_reconnected)
 assert "`r(reconrule)'" == "key"
-assert `share_key' >= `o_share' - .01
-assert `added_key' > 0
+assert inrange(`share_key', `o_share' - .01, 1)
+assert inrange(`added_key', 1, 3000)
 bysort worker: egen byte kmn = min(gk)
 bysort worker: egen byte kmx = max(gk)
 assert kmn == kmx
@@ -352,7 +387,25 @@ xsamplefe 100, count unit(u) mobility(f) recontarget(56) seed(51) generate(at56)
 assert r(N_units_reconnected) == 0 & at56 == at
 xsamplefe 100, count unit(u) mobility(f) recontarget(57) seed(51) generate(at57)
 assert r(N_units_reconnected) == 3 & r(lcc_share) == 59/103
-noi di as text "  reconnect: deterministic (1/8 threads, shuffled rows) and target-aware"
+* the gain of a unit is recomputed when its turn comes. Every stayer is drawn
+* and no mover: firm 1 (10 rows) is the largest component, firm 2 has 5 rows
+* and firm 3 has 3. Workers 19 and 20 join firm 2 (gain 7 each), worker 21
+* joins firm 3 (gain 5). Once 19 or 20 is in, the other one gains 2 rows and
+* worker 21 gains 5: worker 21 is the second unit, and the component is whole
+clear
+quietly set obs 24
+gen long worker = _n
+replace worker = 19 + int((_n - 19) / 2) if _n > 18
+gen int firm = cond(worker <= 10, 1, cond(worker <= 15, 2, 3))
+bysort worker: replace firm = cond(_n == 1, 1, cond(worker == 21, 3, 2)) if worker > 18
+xsamplefe 100, unit(worker) mobility(firm) movers(0) stayers(100) connectivity seed(52) generate(before)
+assert r(N_units_sampled) == 18 & r(N_movers_eligible) == 3 & r(lcc_share) == 10/18
+xsamplefe 100, unit(worker) mobility(firm) movers(0) stayers(100) recontarget(86) seed(52) generate(after)
+assert r(N_units_reconnected) == 2 & r(N_reconnected) == 4 & r(lcc_share) == 1
+assert after == 1 if worker == 21
+quietly count if after & inlist(worker, 19, 20)
+assert r(N) == 2
+noi di as text "  reconnect: deterministic (1/8 threads, shuffled rows), target-aware, gains recomputed"
 
 * ---------------------------------------------------------------------------
 * 4. mobstrata: the mobility class of the unit as a native stratum
@@ -416,6 +469,22 @@ xcert_mpm, unit(idcode) mob(ind_code)
 assert abs(r(mean) - `s_mean') < 1e-12
 assert abs(r(weak) - `s_weak') < 1e-12
 restore
+* the retained movers are the retained units with two or more values in the
+* frame, whatever connected leaves of them
+set seed 2
+xsamplefe 10, absorb(idcode ind_code) connected generate(gcon)
+local m_retained = r(N_movers_retained)
+local u_retained = r(N_units_retained)
+bysort idcode ind_code: gen byte __fv = _n == 1
+bysort idcode: egen int __nv = total(__fv)
+bysort idcode (gcon): gen byte __fu = _n == 1
+quietly count if __fu & gcon == 1
+assert r(N) == `u_retained'
+quietly count if __fu & gcon == 1 & __nv >= 2
+assert r(N) == `m_retained' & r(N) < `u_retained'
+quietly count if __fu & gcon == 1 & __nv >= 3
+assert r(N) < `m_retained'
+drop __fv __nv __fu gcon
 * the statistic is part of the diagnostics: missing without them, and asking
 * for it never changes the draw
 set seed 2
@@ -441,13 +510,13 @@ save `mmpop'
 * mover; minmovers(2) removes them and everything they drag with them
 set seed 1
 xsamplefe 10, absorb(worker firm year) connectivity generate(plain)
-assert r(N_units_sampled) == 300 & r(weak_mob_share) > .1
+assert r(N_units_sampled) == 300 & inrange(r(weak_mob_share), .1, 1)
 use `mmpop', clear
 set seed 1
 xsamplefe 10, absorb(worker firm year) minmovers(2) generate(m2)
 assert r(N_units_sampled) == 300
 assert r(N_units_retained) == r(N_units_sampled) - r(N_units_minmovers_dropped)
-assert r(N_units_minmovers_dropped) > 0 & r(minmovers_iterations) >= 2
+assert r(N_units_minmovers_dropped) == 46 & r(N_minmovers_dropped) == 368 & r(minmovers_iterations) == 5
 assert r(weak_mob_share) == 0
 bysort worker: egen byte mn = min(m2)
 bysort worker: egen byte mx = max(m2)
@@ -485,7 +554,28 @@ set seed 1
 xsamplefe 10, absorb(worker firm year) minmovers(3) generate(m3)
 assert r(N_units_retained) == 0 & r(N_frame_retained) == 0
 assert m3 == 0
+* the bound is inclusive. Workers 1 and 2 move between firms 1 and 2, worker 3
+* between firms 2 and 3, worker 4 stays in firm 3: firm 3 has one mover and
+* goes with workers 3 and 4, and firms 1 and 2 are left with two movers each
+clear
+input long worker int firm
+1 1
+1 2
+2 1
+2 2
+3 2
+3 3
+4 3
+end
+xsamplefe 100, unit(worker) mobility(firm) minmovers(2) generate(m2)
+assert r(N_units_minmovers_dropped) == 2 & r(N_minmovers_dropped) == 3 & r(minmovers_iterations) == 2
+assert m2 == (worker <= 2)
+xsamplefe 100, unit(worker) mobility(firm) minmovers(1) generate(m1)
+assert r(N_units_minmovers_dropped) == 0 & r(minmovers_iterations) == 1 & m1 == 1
+xsamplefe 100, unit(worker) mobility(firm) minmovers(3) generate(m3)
+assert r(N_units_minmovers_dropped) == 4 & m3 == 0
 * refused where a whole-unit rule cannot hold
+use `mmpop', clear
 capture xsamplefe 20, absorb(worker firm year) minmovers(2) reconnect
 assert _rc == 198
 capture xsamplefe 20, unit(worker) minmovers(2)
@@ -511,14 +601,14 @@ foreach d in patents synthetic-assortative enron {
     set seed 1
     quietly xsamplefe 10, absorb(id1 id2) reconnect generate(s1)
     * reconnect can stop early when the frontier runs out, never go backwards
-    assert r(lcc_share) >= `sshare'
+    assert inrange(r(lcc_share), `sshare', 1)
     assert s1 >= s0
     local g_share = r(lcc_share)
     local g_added = r(N_units_reconnected)
     local g_rows = r(N_frame_retained)
     set seed 1
     quietly xsamplefe 10, absorb(id1 id2) reconnect reconrule(key) generate(s2)
-    assert r(lcc_share) >= `sshare'
+    assert inrange(r(lcc_share), `sshare', 1)
     assert s2 >= s0
     local ran 1
     noi di as text "  `d': frame largest " %5.1f 100 * `fshare' "%, sample " %5.1f 100 * `sshare' ///

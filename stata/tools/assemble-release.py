@@ -52,7 +52,8 @@ def assemble(artifacts, out):
     (out / "xsamplefe.pkg").write_text(pkg + "\n".join(additions) + "\n")
     metadata = {"version": version, "commit": os.environ["GITHUB_SHA"],
                 "workflow_run": os.environ.get("GITHUB_RUN_ID"), "platforms": receipts,
-                "native_stata_validation": "performed separately on the exact Linux artifact",
+                "native_stata_validation": ("not part of this build: run afterwards on the exact Linux "
+                                            "artifact and reported in the release notes"),
                 "installation": "https://github.com/reisportela/xsamplefe/releases/latest/download"}
     (out / "RELEASE.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
     payload = sorted(p.name for p in out.iterdir() if p.is_file())

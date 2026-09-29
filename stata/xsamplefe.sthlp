@@ -1,5 +1,5 @@
 {smcl}
-{* *! version 1.4.2  25sep2026}{...}
+{* *! version 1.4.3  29sep2026}{...}
 {vieweralsosee "[D] sample" "help sample"}{...}
 {vieweralsosee "[R] bsample" "help bsample"}{...}
 {vieweralsosee "" "--"}{...}
@@ -179,8 +179,9 @@ observations, it can draw whole {it:units} (workers, firms, patents, ...).
 This preserves their histories when no different {opt group()} overrides the
 unit decision. It does not guarantee estimability: missing regression variables,
 singletons, disconnected components and insufficient within-unit variation still
-need to be checked in the intended regression. Requires Stata 14 or newer and
-a compatible compiled plugin; neither estimator is needed to draw a sample.
+need to be checked in the intended regression. Requires Stata 14.1 or newer
+(the plugin interface of Stata 14.1) and a compatible compiled plugin; neither
+estimator is needed to draw a sample.
 
 {pstd}
 The plugin uses 32-bit row and graph indices: datasets of 2,147,483,647 or more
@@ -233,7 +234,8 @@ newer (RHEL 8, Ubuntu 20.04 and later systems) and the OpenMP runtime
 1.4.0 needed the C++ runtime of GCC 11. If Stata reports that
 {cmd:xsamplefe.plugin} could not be loaded, run {cmd:ldd} on the installed file
 ({cmd:findfile xsamplefe.plugin} gives its path) in a terminal: each line with
-{cmd:not found} names what is missing.
+{cmd:not found} names what is missing. On macOS the released plugins need
+macOS 14 or newer on Apple Silicon and macOS 15 or newer on Intel.
 
 
 {marker units}{...}
@@ -254,7 +256,10 @@ sampling frame. By default (strict), a unit with rows both inside and outside
 the frame is an error (as in {cmd:sample2}); {opt any} pulls such units entirely
 into the frame and {opt all} pushes them entirely out (their rows are then
 kept, unsampled). When {opt group()} is specified and differs from the unit,
-these rules apply to groups.
+these rules apply to groups. A group with a row whose {opt unit()} value is
+missing is split in the same way, with or without {it:if}/{it:in}: that row
+has no unit, so {opt any} cannot pull it in and stops with an error, and
+{opt all} leaves the group out.
 
 {pstd}
 {it:Eligibility.} Among the units in the frame, only those meeting
@@ -384,7 +389,13 @@ product is exactly a half and {it:n}*(#/100) falls just below it: 29 percent of
 {pstd}
 Failed plugin calls, including split-frame or inconsistent-stratum errors, and
 plugin loading failures restore the random-number state from before the call,
-including when {opt seed()} was supplied.
+including when {opt seed()} was supplied. A {opt generate()} name that cannot
+be given is refused before anything is drawn.
+
+{pstd}
+{it:#}, {opt movers()}, {opt stayers()} and {opt recontarget()} may be written
+in any form Stata reads, such as {cmd:48}, {cmd:4.8e1} or the hexadecimal
+{cmd:1.8X+005}: the value is the one {cmd:sample} would read.
 
 {pstd}
 The second and further uniform columns start at draw {cmd:_N}+1, so unit-level
@@ -635,7 +646,7 @@ and other values weak: the rule is iterated to a fixed point (jointly with
 {opt connected} when both are given). {cmd:r(N_units_minmovers_dropped)},
 {cmd:r(N_minmovers_dropped)} and {cmd:r(minmovers_iterations)} report the cost.
 The pruning {it:cascades}: on a 10 percent unit draw of that panel
-{cmd:minmovers(2)} drops 46 of 300 units, while {cmd:minmovers(3)} empties the
+{cmd:minmovers(2)} drops 110 of 600 units, while {cmd:minmovers(3)} empties the
 sample and says so. Try a small {it:#} first, and prefer
 {cmd:movers(100) stayers(#)} when what you need is precision.
 
@@ -658,7 +669,8 @@ used instead.
 retained observations (including rows outside {it:if}/{it:in}) and 0 for the
 others, without deleting anything. {opt keep(newvar)} is a synonym. {opt replace}
 allows {it:newvar} to exist. The name is matched exactly and reserved names
-({cmd:_all}, {cmd:_n}, {cmd:_N}, {cmd:_b}, {cmd:_se}, {cmd:_cons}, ...) are
+({cmd:_all}, {cmd:_n}, {cmd:_N}, {cmd:_b}, {cmd:_se}, {cmd:_cons}, ...),
+storage types ({cmd:str5}) and the names of Stata's temporary variables are
 refused: a new name that happens to abbreviate an existing variable creates a
 new variable and leaves the existing one alone, and the old variable is only
 dropped once the new indicator exists. When the frame is empty (no row selected
@@ -675,14 +687,19 @@ state is returned in {cmd:r(rngstate)}).
 sample is meant for, in {cmd:reghdfe} syntax: plain variables, {cmd:i.} prefixes,
 {cmd:#} interactions (compacted with {cmd:egen group()}), {it:name}{cmd:=}{it:var}
 labels and heterogeneous-slope terms ({cmd:fe#c.x}, {cmd:fe##c.(x z)},
-{cmd:fe##(c.x c.z)}, whose continuous parts do not define units). Plain wildcards
+{cmd:fe##(c.x c.z)}, whose continuous parts do not define units). {cmd:##}
+between two categorical variables is their interaction, as {cmd:#} is and as
+{cmd:reghdfe} reads it. Plain wildcards
 and variable ranges expand to separate effects, not an interaction. Each
 categorical part of a {cmd:#} interaction must resolve to one variable.
 Abbreviations obey {cmd:set varabbrev}; use full names when it is off.
 An {opt absorb()} list without a categorical dimension requires an explicit
 {opt unit()} or {opt group()}. Anything after a comma is discarded. The first entry is the default
 sampling unit and the first other entry, excluding the {opt time()} variable,
-is the default {opt mobility()} dimension.
+is the default {opt mobility()} dimension. The {helpb xtset} time variable is
+excluded only when {opt time()}, {opt balanced}, {opt minperiods()} or
+{opt maxperiods()} brings it in; a note says so when it becomes the default
+mobility dimension.
 
 {phang}{opth group(varname)} and {opth individual(varname)} declare a
 {cmd:reghdfe, group() individual()} design. {opt group()} becomes the sampling
@@ -795,6 +812,9 @@ per-unit statistics, the draw, the retention rules and the construction of the
 graph links run in parallel; the union-find over the distinct links, the
 {opt reconnect} search and reading and writing the data through Stata's plugin
 interface run on one thread. No result depends on the number of threads.
+With 0 the team is the whole machine, whatever the size of the data: on small
+data, in loops and on a shared server a team of that size costs more than it
+saves, and {cmd:numthreads(1)} is the faster choice.
 
 {phang}{opt verbose} prints the elapsed time of every plugin phase.
 

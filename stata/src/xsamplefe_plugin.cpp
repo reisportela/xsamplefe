@@ -76,7 +76,7 @@ constexpr const char* kPrefix = "xsamplefe plugin: ";
 // before anything else: a plugin loaded earlier in the Stata session stays in
 // use after net install, a rebuild or discard, and the ado refuses to run on
 // one of another release.
-constexpr const char* kPluginVersion = "10402";
+constexpr const char* kPluginVersion = "10403";
 
 [[noreturn]] void fail(const std::string& msg) {
     throw std::runtime_error(std::string(kPrefix) + msg);
@@ -180,7 +180,9 @@ double parse_double(const std::string& raw_in, const char* what) {
     char* end = nullptr;
     errno = 0;
     const double v = std::strtod(raw.c_str(), &end);
-    if (errno != 0 || end == raw.c_str() || *end != '\0') {
+    // an underflow (1e-320, 1e-400) gives the subnormal or the zero Stata reads
+    const bool underflow = (errno == ERANGE && std::fabs(v) < 1.0);
+    if ((errno != 0 && !underflow) || end == raw.c_str() || *end != '\0') {
         fail(std::string("invalid numeric for ") + what + ": " + raw);
     }
     return v;
@@ -1085,9 +1087,18 @@ STDLL stata_call(int argc, char* argv[]) {
                 }
                 for (int64_t b = 0; b < nblock; ++b) n_split += split[static_cast<std::size_t>(b)];
                 if (cfg.frame_rule == FrameRule::Strict && n_split > 0) {
-                    fail(std::to_string(n_split) + (cfg.has_group ? " group(s)" : " unit(s)") +
-                         " have rows both inside and outside if/in; sampling units must be complete "
-                         "(specify option any or all to resolve)");
+                    // a group is also split by a missing unit() value in one
+                    // of its rows; without if/in that is the only cause
+                    const char* why = " have rows both inside and outside if/in; sampling units must be complete "
+                                      "(specify option any or all to resolve)";
+                    if (cfg.has_group && cfg.frame_from_keys) {
+                        why = " have rows with a missing unit() value, which are outside the sampling frame; "
+                              "groups must be complete (specify option all to leave them out)";
+                    } else if (cfg.has_group) {
+                        why = " have rows both inside and outside the sampling frame (if/in, or a missing "
+                              "unit() value); groups must be complete (specify option any or all to resolve)";
+                    }
+                    fail(std::to_string(n_split) + (cfg.has_group ? " group(s)" : " unit(s)") + why);
                 }
             }
             timer.mark("frame rule");

@@ -1,13 +1,13 @@
 v 3
-d xsamplefe 1.4.2: random samples of panel / fixed-effect data for reghdfe and xhdfe
+d xsamplefe 1.4.3: random samples of panel / fixed-effect data for reghdfe and xhdfe
 d
 d Draws whole-unit random samples aligned with reghdfe's absorb(), group() and
 d individual(); reproduces sample and sample2 for the simple cases; strata,
 d balanced panels, mobility structure, connectivity diagnostics, connected sets
 d and reconnect; frequency weights for tables of distinct rows.
 d C++/OpenMP plugin without external dependencies.
-d Requires Stata 14 or newer and a plugin built for the host platform.
-d Distribution-Date: 20260925
+d Requires Stata 14.1 or newer and a plugin built for the host platform.
+d Distribution-Date: 20260929
 d The source checkout provides the build script in stata/tools/.
 f xsamplefe.ado
 f xsamplefe.sthlp

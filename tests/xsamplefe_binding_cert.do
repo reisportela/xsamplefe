@@ -11,6 +11,15 @@ clear
 set obs 100
 gen long worker = ceil(_n / 5)
 xsamplefe 50, unit(worker) seed(1) generate(reference) numthreads(1)
+
+* macro drop _all, a common do-file header, removes the global that names the
+* path of the plugin still bound (and the locals of this file): the path is
+* kept a second time, so the next call goes through
+macro drop _all
+local source : env XSAMPLEFE_ADOPATH
+local output : env XSAMPLEFE_TEST_OUTDIR
+xsamplefe 50, unit(worker) seed(1) generate(after_macro_drop) numthreads(1)
+assert after_macro_drop == reference
 local state = c(rngstate)
 
 * A loaded plugin from a different location must be refused until discard.

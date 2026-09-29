@@ -1,4 +1,4 @@
-*! version 1.4.2  25sep2026
+*! version 1.4.3  29sep2026
 *! xsamplefe: panel / fixed-effect aware random sampling for reghdfe and xhdfe
 *! - sample / sample2 semantics for the simple cases (drawn rows are
 *!   bit-identical to sample under the same seed and data order)
@@ -9,7 +9,7 @@
 *! - OpenMP C++ plugin (xsamplefe.plugin) with no external dependencies
 
 program define xsamplefe, rclass byable(onecall)
-    version 14.0
+    version 14.1
 
     // syntax keeps both # and a weight expression in exp: the weight is taken
     // off first, then # is parsed as before
@@ -106,6 +106,16 @@ program define xsamplefe, rclass byable(onecall)
             di as err "variable `generate' already defined"
             exit 110
         }
+        // names such as str5 pass confirm name and fail when the variable is
+        // created, and a name of Stata's temporary variables (__000003) would
+        // be dropped on exit: both are refused here, before anything is drawn
+        if (!`gen_exists') {
+            capture confirm new variable `generate'
+            if (_rc | regexm("`generate'", "^__[0-9A-Z][0-9A-Z][0-9A-Z][0-9A-Z][0-9A-Z][0-9A-Z]$")) {
+                di as err "`generate' is not a valid new variable name"
+                exit 198
+            }
+        }
     }
     else if ("`replace'" != "") {
         di as txt "note: option replace has no effect without generate() or keep()"
@@ -159,6 +169,19 @@ program define xsamplefe, rclass byable(onecall)
             di as err "`r'() must be an integer between 0 and 2,147,483,647 when option count is specified"
             exit 198
         }
+    }
+    // numbers reach the plugin as text: a plain decimal literal as typed, any
+    // other form Stata reads (1.8X+005, 1d2) with 17 significant digits, when
+    // that text gives the same value back
+    foreach r in exp movers stayers recontarget {
+        local `r'_text ``r''
+        if ("``r''" == "") continue
+        if (regexm("``r''", "^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$")) continue
+        local alt : display %24.17g ``r''
+        local alt = strtrim("`alt'")
+        capture confirm number `alt'
+        if (_rc) continue
+        if (`alt' == ``r'') local `r'_text `alt'
     }
     if ("`recontarget'" != "" | "`reconrule'" != "") local reconnect reconnect
     if ("`reconrule'" != "") {
@@ -351,6 +374,7 @@ program define xsamplefe, rclass byable(onecall)
     local has_time = ("`time'" != "")
 
     // ---- mobility dimension (never the time variable) -----------------------
+    local mobility_given = ("`mobility'" != "")
     if ("`mobility'" == "" & `has_unit') {
         if ("`group'" != "" & "`individual'" != "") {
             if ("`unit'" == "`group'") local mobility `individual'
@@ -378,6 +402,14 @@ program define xsamplefe, rclass byable(onecall)
         exit 198
     }
     local has_mob = ("`mobility'" != "")
+    // the xtset time variable is excluded from the default only when a time
+    // option resolves it: say so when it becomes the mobility dimension
+    if (`has_mob' & !`mobility_given') {
+        local tsvar : char _dta[_TStvar]
+        if ("`tsvar'" != "" & "`tsvar'" == "`mobility'") {
+            di as txt "{p 0 6 2}note: the default mobility dimension, `mobility', is the xtset time variable; specify mobility(), or time(`mobility') to take the next absorb() variable{p_end}"
+        }
+    }
     if (!`has_mob' & (`minmobility' >= 0 | `maxmobility' >= 0 | "`movers'" != "" | ///
                        "`stayers'" != "" | "`connected'" != "" | "`reconnect'" != "" | ///
                        "`mobstrata'" != "" | "`connectivity'" != "" | "`minmovers'" != "")) {
@@ -395,7 +427,7 @@ program define xsamplefe, rclass byable(onecall)
         exit 198
     }
     local recon_target -1
-    if ("`recontarget'" != "") local recon_target `recontarget'
+    if ("`recontarget'" != "") local recon_target `recontarget_text'
     local minmov -1
     if ("`minmovers'" != "") local minmov `minmovers'
     // the connectivity diagnostics cost a union-find over the frame rows: they
@@ -474,7 +506,9 @@ program define xsamplefe, rclass byable(onecall)
         else {
             local d1 32
             if ("`c(rng_current)'" == "mt64") local d1 52
-            local d = log(-log1m(`pduplicates'))
+            // sample's rule; log1m() dates from the Stata 15 update of 07aug2018
+            capture local d = log(-log1m(`pduplicates'))
+            if (_rc) local d = log(-ln(1 - `pduplicates'))
             local d = ceil((2 * log(`nobs') - `d') / log(2) - 1)
             local d = ceil(`d' / `d1')
             local nu = max(2, `d')
@@ -495,14 +529,14 @@ program define xsamplefe, rclass byable(onecall)
         local count_plugin : display %21.0f min(`exp', _N)
         local cfg "`cfg'count=`count_plugin';"
     }
-    else local cfg "`cfg'pct=`exp';"
+    else local cfg "`cfg'pct=`exp_text';"
     local cfg "`cfg'has_unit=`has_unit';nby=`nby';has_time=`has_time';has_mob=`has_mob';"
     local cfg "`cfg'has_group=`has_block';has_weight=`has_weight';nu=`nu';frame_rule=`frame_rule';group_rule=`grouprule';"
     local cfg "`cfg'balanced=`=("`balanced'" != "")';minobs=`minobs';maxobs=`maxobs';"
     local cfg "`cfg'minperiods=`minperiods';maxperiods=`maxperiods';"
     local cfg "`cfg'minmob=`minmobility';maxmob=`maxmobility';"
-    if ("`movers'" != "") local cfg "`cfg'rate_movers=`movers';"
-    if ("`stayers'" != "") local cfg "`cfg'rate_stayers=`stayers';"
+    if ("`movers'" != "") local cfg "`cfg'rate_movers=`movers_text';"
+    if ("`stayers'" != "") local cfg "`cfg'rate_stayers=`stayers_text';"
     local cfg "`cfg'mobstrata=`=("`mobstrata'" != "")';connectivity=`=("`connectivity'" != "")';"
     local cfg "`cfg'reconnect=`=("`reconnect'" != "")';recon_target=`recon_target';recon_rule=`reconrule';"
     local cfg "`cfg'minmovers=`minmov';"
@@ -536,9 +570,15 @@ program define xsamplefe, rclass byable(onecall)
     local plugin_prog "__xsamplefe_plugin"
     capture program `plugin_prog', plugin using("`plugin_path'")
     local load_rc = _rc
-    // r(110) means still loaded; after discard a new binding succeeds even
-    // though the old path macro survives. Never call a plugin at another path.
-    if (`load_rc' == 110 & "$XSAMPLEFE_PLUGIN_PATH_INTERNAL" != "`plugin_path'") {
+    // r(110) means still bound, to the path kept in a global and, because
+    // macro drop _all removes globals, in a Mata external as well
+    local bound_path "$XSAMPLEFE_PLUGIN_PATH_INTERNAL"
+    if (`load_rc' == 110 & `"`bound_path'"' == "") {
+        capture mata: st_local("bound_path", findexternal("XSAMPLEFE_PLUGIN_PATH_INTERNAL") == NULL ? "" : *findexternal("XSAMPLEFE_PLUGIN_PATH_INTERNAL"))
+    }
+    // after discard a new binding succeeds even though the old path
+    // survives. Never call a plugin at another path.
+    if (`load_rc' == 110 & `"`bound_path'"' != "`plugin_path'") {
         di as err "xsamplefe: the active session is still bound to an older xsamplefe.plugin path"
         di as err "xsamplefe: run discard (with no arguments) and rerun the command"
         quietly set rngstate `rngstate'
@@ -551,8 +591,10 @@ program define xsamplefe, rclass byable(onecall)
         exit `load_rc'
     }
     global XSAMPLEFE_PLUGIN_PATH_INTERNAL "`plugin_path'"
+    capture mata: (void) crexternal("XSAMPLEFE_PLUGIN_PATH_INTERNAL")
+    capture mata: *findexternal("XSAMPLEFE_PLUGIN_PATH_INTERNAL") = st_local("plugin_path")
 
-    // the plugin reports its release in local xsf_plugin_version (10402 = 1.4.2);
+    // the plugin reports its release in local xsf_plugin_version (10403 = 1.4.3);
     // releases before 1.4.0 report nothing
     local xsf_plugin_version
     capture noisily plugin call `plugin_prog' `touse' `unit_use' `by_use' `time_use' ///
@@ -570,7 +612,7 @@ program define xsamplefe, rclass byable(onecall)
         threads_requested threads_effective threads_used openmp_enabled thread_capacity
     // a plugin loaded earlier in the session stays in use after net install, a
     // rebuild or discard, so one of another release must be refused here
-    if ("`xsf_plugin_version'" != "10402") {
+    if ("`xsf_plugin_version'" != "10403") {
         foreach s of local scalars {
             capture scalar drop `sp'`s'
         }
@@ -601,7 +643,14 @@ program define xsamplefe, rclass byable(onecall)
     if ("`generate'" != "") {
         // the byte indicator itself becomes the variable: no copy of _N rows
         if (`gen_exists') drop `generate'
-        rename `out' `generate'
+        capture rename `out' `generate'
+        if (_rc) {
+            // a name that cannot be given (it met a temporary variable)
+            local rc = _rc
+            quietly set rngstate `rngstate'
+            di as err "`generate' is not a valid new variable name"
+            exit `rc'
+        }
         label variable `generate' "xsamplefe: 1 = retained in sample"
     }
     else {
